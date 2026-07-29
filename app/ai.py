@@ -77,11 +77,38 @@ class AnalysisResult:
 class AIAnalyzer:
     def __init__(self, config: AIConfig):
         self.config = config
+        # max_retries=0：禁用 openai SDK 内置重试，确保 aclose() 后请求立即失败
+        # 重试逻辑由 analyze_batch 内部控制（基于异常类型决定是否重试）
         self.client = AsyncOpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
             timeout=config.timeout,
+            max_retries=0,
         )
+        # 持有底层 httpx client，停止任务时可直接 aclose() 中断进行中的请求
+        self._httpx_client = self.client._client
+
+    def aclose(self) -> None:
+        """强制关闭底层 HTTP transport，中断所有进行中的 AI 请求。
+
+        停止任务时调用，实现秒级中断（asyncio.Task.cancel 对 httpx 进行中请求不立即生效）。
+        直接关闭 transport 是非阻塞操作，进行中的请求会立即收到连接异常。
+        关闭后会重建 client，避免后续请求复用已关闭的连接。
+        """
+        # 直接关闭底层 transport（同步非阻塞），让进行中的请求立即收到连接异常
+        try:
+            if self._httpx_client._transport is not None:
+                self._httpx_client._transport.close()
+        except Exception:
+            pass
+        # 重建 client，避免后续请求复用已关闭的连接
+        self.client = AsyncOpenAI(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            timeout=self.config.timeout,
+            max_retries=0,
+        )
+        self._httpx_client = self.client._client
 
     async def analyze_batch(self, items: list[dict]) -> list[AnalysisResult]:
         """分析一批弹幕。
@@ -111,12 +138,13 @@ class AIAnalyzer:
         if self.config.reasoning_effort and self.config.reasoning_effort.strip():
             kwargs["reasoning_effort"] = self.config.reasoning_effort.strip()
 
-        for attempt in range(1, 3):
+        for attempt in range(1, 4):
             try:
                 t0 = time.monotonic()
+                cur_max = kwargs.get("max_tokens", self.config.max_tokens)
                 logger.info(
                     "AI 请求开始 model=%s count=%d attempt=%d max_tokens=%d reasoning=%s",
-                    self.config.model, len(items), attempt, self.config.max_tokens,
+                    self.config.model, len(items), attempt, cur_max,
                     self.config.reasoning_effort or "-",
                 )
                 resp = await self.client.chat.completions.create(**kwargs)
@@ -124,10 +152,21 @@ class AIAnalyzer:
                 text = choice.message.content or ""
                 elapsed = time.monotonic() - t0
                 if not text.strip():
-                    # 思考型模型可能因 max_tokens 不足在推理阶段被截断
+                    # 思考型模型可能因 max_tokens 不足在推理阶段被截断（finish=stop 但 content 为空）
+                    # 临时加倍 max_tokens 重试，给模型更多输出空间
+                    if attempt < 3:
+                        new_max = min(cur_max * 2, 16000)
+                        logger.warning(
+                            "AI 返回空内容(finish=%s, %.1fs)，max_tokens=%d 不足，加倍到 %d 后重试",
+                            choice.finish_reason, elapsed, cur_max, new_max,
+                        )
+                        kwargs["max_tokens"] = new_max
+                        # 移除 reasoning_effort 进一步抑制思考，给输出腾出 token 空间
+                        kwargs.pop("reasoning_effort", None)
+                        continue
                     logger.warning(
-                        "AI 返回空内容(finish=%s, %.1fs)，可能 max_tokens 不足或模型仍在思考，跳过该批 %d 条",
-                        choice.finish_reason, elapsed, len(items),
+                        "AI 返回空内容(finish=%s, %.1fs)，已重试 %d 次仍失败，该批 %d 条计入分析失败",
+                        choice.finish_reason, elapsed, attempt - 1, len(items),
                     )
                     return []
                 logger.info(
@@ -135,9 +174,27 @@ class AIAnalyzer:
                     elapsed, choice.finish_reason, len(text),
                 )
                 return self._parse(text, items)
+            except asyncio.CancelledError:
+                # 任务被取消（通常是停止信号触发）：不重试，向上抛出
+                raise
             except Exception as e:
                 elapsed = time.monotonic() - t0
                 last_exc = e
+                # 检查是否为连接异常（aclose 会导致 Connection error）
+                # 若是，说明是停止信号触发的中断，不再重试
+                err_msg = str(e).lower()
+                is_connection_error = (
+                    "connection error" in err_msg
+                    or "connection reset" in err_msg
+                    or "connection closed" in err_msg
+                    or isinstance(e, (ConnectionError,))
+                )
+                if is_connection_error:
+                    logger.warning(
+                        "AI 连接异常(第%d次, %.1fs): %s，可能是停止信号触发，不再重试",
+                        attempt, elapsed, e,
+                    )
+                    return []
                 # 部分后端不支持 reasoning_effort 参数，首次失败时移除后重试
                 if attempt == 1 and "reasoning_effort" in kwargs:
                     logger.warning(
@@ -148,7 +205,7 @@ class AIAnalyzer:
                     continue
                 logger.warning("AI 批分析失败(第%d次, %.1fs): %s", attempt, elapsed, e)
                 # 重试前短退避，避免本地模型过载时连续冲击
-                if attempt < 2:
+                if attempt < 3:
                     backoff = 2.0 * attempt
                     logger.info("AI 重试 %.1fs 后再次请求", backoff)
                     await asyncio.sleep(backoff)
@@ -159,7 +216,7 @@ class AIAnalyzer:
     def _parse(self, text: str, items: list[dict]) -> list[AnalysisResult]:
         obj = self._extract_json(text)
         if obj is None:
-            logger.warning("AI 返回无法解析为 JSON: %s", text[:200])
+            logger.warning("AI 返回无法解析为 JSON，原始内容：\n%s", text)
             return []
 
         raw_items = obj.get("items") if isinstance(obj, dict) else None
@@ -168,7 +225,7 @@ class AIAnalyzer:
             if isinstance(obj, list):
                 raw_items = obj
             else:
-                logger.warning("AI 返回缺少 items 字段: %s", text[:200])
+                logger.warning("AI 返回缺少 items 字段，原始内容：\n%s", text)
                 return []
 
         id_map: dict[int, AnalysisResult] = {}

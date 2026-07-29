@@ -722,6 +722,8 @@ class TaskManager:
 
         batch_size = max(1, self.settings.ai.batch_size)
         total_audit = len(audit_items)
+        # 预初始化，避免循环首次迭代即 break 时引用未定义变量
+        start = 0
 
         for start in range(0, total_audit, batch_size):
             if task.stop_requested:
@@ -732,10 +734,23 @@ class TaskManager:
                 break
             batch = audit_items[start:start + batch_size]
             batch_no = start // batch_size + 1
-            await bus.log(
-                task.id, "info",
-                f"AI 分析批次 {batch_no}（送审 {len(batch)} 条，进度 {task.stats.analyzed}/{task.stats.total}）",
-            )
+            # 统计本批对应的 dmid 数，让用户理解送审内容数与 dmid 数的差异
+            batch_dmid_count = 0
+            for item in batch:
+                if content_to_dmids is not None:
+                    batch_dmid_count += len(content_to_dmids[item["content"]])
+                else:
+                    batch_dmid_count += 1
+            if content_to_dmids is not None:
+                await bus.log(
+                    task.id, "info",
+                    f"AI 分析批次 {batch_no}（送审 {len(batch)} 条内容，对应 {batch_dmid_count} 条 dmid，进度 {task.stats.analyzed}/{task.stats.total}）",
+                )
+            else:
+                await bus.log(
+                    task.id, "info",
+                    f"AI 分析批次 {batch_no}（送审 {len(batch)} 条，进度 {task.stats.analyzed}/{task.stats.total}）",
+                )
             results = await self._analyze_batch_interruptible(task, batch)
             if results is None:
                 # 被停止信号中断
@@ -787,20 +802,20 @@ class TaskManager:
             if batch_violating > 0:
                 await bus.log(
                     task.id, "info",
-                    f"批次 {batch_no} 完成：发现违规 {batch_violating} 条，已分析 {task.stats.analyzed}/{task.stats.total}",
+                    f"批次 {batch_no} 完成：发现违规 {batch_violating} 条 dmid，已分析 {task.stats.analyzed}/{task.stats.total} 条 dmid",
                 )
             else:
                 await bus.log(
                     task.id, "info",
-                    f"批次 {batch_no} 完成：已分析 {task.stats.analyzed}/{task.stats.total}",
+                    f"批次 {batch_no} 完成：已分析 {task.stats.analyzed}/{task.stats.total} 条 dmid",
                 )
             await bus.stats(task.id, stats_to_dict(task.stats))
 
         # 停止/上限时未分析的部分计入跳过（按 dmid 口径）
         if task.stop_requested or (max_reports > 0 and task.stats.reported >= max_reports):
-            # 计算尚未进入 AI 分析阶段的 dmid 数：processed 为本阶段已送审的条目数
-            processed = min(start + (len(batch) if batch else 0), total_audit) if audit_items else 0
-            remaining_audit = max(0, total_audit - processed)
+            # 计算尚未进入 AI 分析阶段的 dmid 数：start 为下一个待处理批次的起点，
+            # 即已送审的条目数（中断批次未完成，不计入已送审）
+            remaining_audit = max(0, total_audit - start) if audit_items else 0
             if remaining_audit > 0:
                 skipped_dmids = 0
                 for item in audit_items[-remaining_audit:]:
@@ -816,7 +831,7 @@ class TaskManager:
         """输出分析+举报阶段的汇总日志与统计。"""
         await bus.log(
             task.id, "info",
-            f"处理结束：已分析 {task.stats.analyzed} 条，违规 {task.stats.violating} 条，"
+            f"处理结束：已分析 {task.stats.analyzed} 条 dmid，违规 {task.stats.violating} 条，"
             f"举报成功 {task.stats.success}，失败 {task.stats.failed}，"
             f"AI 分析失败 {task.stats.analysis_failed} 条，跳过 {task.stats.skipped}",
         )
@@ -828,6 +843,8 @@ class TaskManager:
         """执行一批 AI 分析，可被 task.stop_event 中断。
 
         返回 AnalysisResult 列表；若被停止信号中断则返回 None。
+        停止时通过 analyzer.aclose() 强制关闭底层 HTTP 连接，实现秒级中断
+        （asyncio.Task.cancel 对 httpx 进行中请求不立即生效）。
         """
         ai_task = asyncio.create_task(self.analyzer.analyze_batch(batch))
         stop_task = asyncio.create_task(task.stop_event.wait())
@@ -836,16 +853,19 @@ class TaskManager:
                 {ai_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
             )
             if stop_task in done:
-                # 停止信号先到：取消 AI 调用
-                ai_task.cancel()
+                # 停止信号先到：强制关闭 AI 底层 HTTP transport，秒级中断进行中的请求
+                logger.info("停止信号到达，强制中断 AI 请求...")
+                # aclose 现在是同步关闭 transport，不会阻塞
                 try:
-                    await ai_task
-                except asyncio.CancelledError:
-                    # 取消导致的 CancelledError 是预期的，吞掉
-                    pass
+                    self.analyzer.aclose()
                 except Exception:
-                    # AI 任务自身的异常在取消时也可能抛出，记录但不传播
-                    logger.debug("AI 任务取消时抛出异常", exc_info=True)
+                    pass
+                ai_task.cancel()
+                # 短暂等待 ai_task 收到连接异常后退出
+                try:
+                    await asyncio.wait_for(asyncio.shield(ai_task), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
                 return None
             # AI 先完成：取消 stop 监听
             stop_task.cancel()
