@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,13 +14,34 @@ from app.bilibili import BiliClient
 from app.config import Settings, load_accounts, load_settings
 from app.core import BannedDictionary, TaskManager
 from app.logger import register_secret, setup_logging
-from app.paths import resource_path
+from app.paths import resource_path, runtime_path
 from app.web.routes import create_router
+
+
+def _ensure_user_configs() -> None:
+    """首次启动时自动从内置示例复制 config.yaml / accounts.yaml 到 exe 同级目录。
+
+    打包后示例配置位于 _internal/（只读），程序运行时在 exe 同级目录查找可写配置。
+    若用户未手动复制示例配置，此处自动复制一份，免去用户查找 _internal 目录的麻烦。
+    """
+    for name in ("config.example.yaml", "accounts.example.yaml"):
+        target_name = name.replace(".example", "")
+        target = runtime_path(target_name)
+        if target.exists():
+            continue
+        src = resource_path(name)
+        if src.exists():
+            try:
+                shutil.copyfile(src, target)
+            except OSError:
+                # 复制失败不阻断启动，后续 load_settings 会给出明确错误
+                pass
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log = logging.getLogger("app.main")
+    _ensure_user_configs()
     s: Settings = load_settings("config.yaml")
     setup_logging()
 
