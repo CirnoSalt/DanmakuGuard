@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DanmakuGuard</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #181b22;
+    --panel-2: #20242d;
+    --border: #2a2f3a;
+    --text: #e6e8ec;
+    --muted: #8b93a3;
+    --accent: #4f8cff;
+    --accent-2: #00a86b;
+    --warn: #f5a623;
+    --err: #ff5c5c;
+    --ok: #2ecc71;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 24px 20px 60px; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+  .session { color: var(--muted); font-size: 13px; }
+  .session b { color: var(--text); }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .input-row { display: flex; gap: 10px; align-items: center; }
+  .input-row input[type="text"] {
+    flex: 1;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+  }
+  .input-row input[type="text"]:focus { border-color: var(--accent); }
+  .loop-label {
+    display: flex; align-items: center; gap: 6px;
+    color: var(--muted); font-size: 13px; cursor: pointer;
+    user-select: none; white-space: nowrap;
+  }
+  .loop-label input { accent-color: var(--accent); }
+  .badge.loop { color: var(--warn); border-color: var(--warn); }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 10px 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: opacity .15s;
+  }
+  button:hover { opacity: .9; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.danger { background: var(--err); }
+  button.ghost { background: var(--panel-2); border: 1px solid var(--border); }
+
+  .status-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+  .badge {
+    padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.running { color: var(--accent); border-color: var(--accent); }
+  .badge.done { color: var(--ok); border-color: var(--ok); }
+  .badge.stopped { color: var(--warn); border-color: var(--warn); }
+  .badge.failed { color: var(--err); border-color: var(--err); }
+  .badge.queued { color: var(--muted); }
+
+  .stats { display: grid; grid-template-columns: repeat(7, 1fr); gap: 10px; margin-bottom: 14px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px; text-align: center;
+  }
+  .stat .num { font-size: 22px; font-weight: 700; }
+  .stat .lbl { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .stat.ok .num { color: var(--ok); }
+  .stat.err .num { color: var(--err); }
+  .stat.warn .num { color: var(--warn); }
+
+  .progress { height: 8px; background: var(--panel-2); border-radius: 6px; overflow: hidden; margin-bottom: 4px; }
+  .progress > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  .progress-label { font-size: 12px; color: var(--muted); }
+
+  .log-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .log-head .t { font-weight: 600; }
+  #log {
+    background: #0b0d12; border: 1px solid var(--border); border-radius: 8px;
+    height: 320px; overflow-y: auto; padding: 10px 12px;
+    font-family: "Consolas", "Courier New", monospace; font-size: 12.5px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #log.paused { opacity: .6; }
+  .line { margin: 0; }
+  .line .ts { color: #5a6273; }
+  .line .lv { font-weight: 700; }
+  .line.info .lv { color: var(--accent); }
+  .line.warning .lv { color: var(--warn); }
+  .line.error .lv { color: var(--err); }
+  .line .msg { color: var(--text); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.title { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--muted); text-align: center; padding: 20px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>DanmakuGuard<span class="sub">AI 审核弹幕 · 自动批量举报</span></h1>
+    <div class="session" id="session">会话：成功 <b id="s-success">0</b> / 失败 <b id="s-failed">0</b></div>
+  </header>
+
+  <div class="card">
+    <div class="input-row">
+      <input id="url" type="text" placeholder="输入目标视频链接或 BV 号，如 https://www.bilibili.com/video/BV1xx..." />
+      <label class="loop-label" title="开启后处理完一轮自动重新拉取弹幕继续，适合长时间挂机监测">
+        <input id="loop-mode" type="checkbox" /> 循环模式
+      </label>
+      <button id="start-btn">开始</button>
+      <button id="stop-btn" class="danger" disabled>停止</button>
+    </div>
+    <div class="status-row">
+      <span>当前任务：</span>
+      <span id="status-badge" class="badge queued">空闲</span>
+      <span id="current-title" style="color:var(--muted)"></span>
+      <span id="loop-badge" class="badge" style="display:none">循环中</span>
+    </div>
+    <div class="hint">提示：任务串行执行，提交后会排队；触发风控会自动冷却退避。循环模式下处理完一轮自动重新拉取弹幕继续。</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="num" id="st-total">0</div><div class="lbl">弹幕总数</div></div>
+    <div class="stat"><div class="num" id="st-analyzed">0</div><div class="lbl">已分析</div></div>
+    <div class="stat warn"><div class="num" id="st-violating">0</div><div class="lbl">判定违规</div></div>
+    <div class="stat"><div class="num" id="st-reported">0</div><div class="lbl">已举报</div></div>
+    <div class="stat ok"><div class="num" id="st-success">0</div><div class="lbl">成功</div></div>
+    <div class="stat err"><div class="num" id="st-failed">0</div><div class="lbl">失败</div></div>
+    <div class="stat"><div class="num" id="st-skipped">0</div><div class="lbl">跳过</div></div>
+  </div>
+
+  <div class="card">
+    <div class="progress"><div id="progress-bar"></div></div>
+    <div class="progress-label" id="progress-label">就绪</div>
+  </div>
+
+  <div class="card">
+    <div class="log-head">
+      <span class="t">实时日志</span>
+      <button id="pause-btn" class="ghost" style="padding:4px 12px;font-size:12px">暂停滚动</button>
+    </div>
+    <div id="log"><div class="empty">提交任务后此处显示实时日志…</div></div>
+  </div>
+
+  <div class="card">
+    <div class="log-head"><span class="t">任务历史</span></div>
+    <table>
+      <thead><tr><th>状态</th><th>标题</th><th>BV</th><th>弹幕</th><th>举报成功</th><th>失败</th><th>时间</th></tr></thead>
+      <tbody id="tasks-body"><tr><td colspan="7" class="empty">暂无任务</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentTaskId = null;
+let evtSource = null;
+let logPaused = false;
+let logAtBottom = true;
+
+const STATUS_TEXT = { queued: "排队中", running: "运行中", done: "完成", stopped: "已停止", failed: "失败" };
+
+function setStats(s) {
+  if (!s) return;
+  $("st-total").textContent = s.total ?? 0;
+  $("st-analyzed").textContent = s.analyzed ?? 0;
+  $("st-violating").textContent = s.violating ?? 0;
+  $("st-reported").textContent = s.reported ?? 0;
+  $("st-success").textContent = s.success ?? 0;
+  $("st-failed").textContent = s.failed ?? 0;
+  $("st-skipped").textContent = s.skipped ?? 0;
+  const analyzed = s.analyzed ?? 0, total = s.total ?? 0;
+  const pct = total > 0 ? Math.min(100, Math.round(analyzed / total * 100)) : 0;
+  $("progress-bar").style.width = pct + "%";
+  $("progress-label").textContent = total > 0 ? `分析进度 ${analyzed}/${total} (${pct}%)` : "就绪";
+}
+
+function setStatusBadge(status, title) {
+  const b = $("status-badge");
+  b.className = "badge " + (status || "queued");
+  b.textContent = STATUS_TEXT[status] || "空闲";
+  $("current-title").textContent = title || "";
+}
+
+function appendLog(level, msg) {
+  const log = $("log");
+  if (log.querySelector(".empty")) log.innerHTML = "";
+  const line = document.createElement("div");
+  line.className = "line " + (level || "info");
+  const ts = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  line.innerHTML = `<span class="ts">${ts}</span> <span class="lv">[${(level||"info").toUpperCase()}]</span> <span class="msg"></span>`;
+  line.querySelector(".msg").textContent = msg;
+  log.appendChild(line);
+  if (logPaused) return;
+  // 用户已向上滚动时保持其位置，不自动滚回底部
+  if (logAtBottom) log.scrollTop = log.scrollHeight;
+}
+
+function startStream(taskId) {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(`/api/tasks/${taskId}/stream`);
+  evtSource.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === "log") {
+      appendLog(ev.level, ev.message);
+    } else if (ev.type === "stats") {
+      setStats(ev.data);
+    } else if (ev.type === "done") {
+      setStats(ev.data.stats);
+      setStatusBadge(ev.data.status, ev.data.title);
+      appendLog("info", `任务结束：${STATUS_TEXT[ev.data.status] || ev.data.status}` + (ev.data.error ? `（${ev.data.error}）` : ""));
+      evtSource.close();
+      evtSource = null;
+      $("start-btn").disabled = false;
+      $("stop-btn").disabled = true;
+      $("loop-badge").style.display = "none";
+      $("url").value = "";
+      loadTasks();
+      loadSession();
+    }
+  };
+  evtSource.onerror = () => { /* 自动重连，无需处理 */ };
+}
+
+async function startTask() {
+  const url = $("url").value.trim();
+  if (!url) { appendLog("warning", "请输入视频链接"); return; }
+  const loopMode = $("loop-mode").checked;
+  $("start-btn").disabled = true;
+  appendLog("info", `提交任务：${url}${loopMode ? "（循环模式）" : ""}`);
+  try {
+    const resp = await fetch("/api/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, loop_mode: loopMode }),
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      appendLog("error", `提交失败：${resp.status} ${t}`);
+      $("start-btn").disabled = false;
+      return;
+    }
+    const task = await resp.json();
+    currentTaskId = task.id;
+    setStatusBadge("running", "");
+    $("stop-btn").disabled = false;
+    // 循环模式显示标记
+    $("loop-badge").style.display = loopMode ? "" : "none";
+    setStats({ total: 0, analyzed: 0, violating: 0, reported: 0, success: 0, failed: 0, skipped: 0 });
+    startStream(task.id);
+  } catch (e) {
+    appendLog("error", `请求异常：${e}`);
+    $("start-btn").disabled = false;
+  }
+}
+
+async function stopTask() {
+  if (!currentTaskId) return;
+  appendLog("warning", "请求停止任务…");
+  try {
+    await fetch(`/api/tasks/${currentTaskId}/stop`, { method: "POST" });
+  } catch (e) {
+    appendLog("error", `停止请求异常：${e}`);
+  }
+}
+
+async function loadTasks() {
+  try {
+    const resp = await fetch("/api/tasks");
+    const list = await resp.json();
+    const body = $("tasks-body");
+    if (!list.length) { body.innerHTML = `<tr><td colspan="7" class="empty">暂无任务</td></tr>`; return; }
+    body.innerHTML = list.map(t => {
+      const s = t.stats || {};
+      const time = (t.started_at || t.created_at || "").replace("T", " ");
+      const loopMark = t.loop_mode ? ` <span class="badge loop" title="循环模式·第${t.loop_round||0}轮">循环</span>` : "";
+      return `<tr>
+        <td><span class="badge ${t.status}">${STATUS_TEXT[t.status]||t.status}</span>${loopMark}</td>
+        <td class="title" title="${escapeHtml(t.title||t.url)}">${escapeHtml(t.title||t.url)}</td>
+        <td>${escapeHtml(t.bvid||"-")}</td>
+        <td>${s.total??0}</td>
+        <td style="color:var(--ok)">${s.success??0}</td>
+        <td style="color:var(--err)">${s.failed??0}</td>
+        <td style="color:var(--muted)">${time}</td>
+      </tr>`;
+    }).join("");
+  } catch {}
+}
+
+async function loadSession() {
+  try {
+    const resp = await fetch("/api/stats");
+    const s = await resp.json();
+    $("s-success").textContent = s.success ?? 0;
+    $("s-failed").textContent = s.failed ?? 0;
+  } catch {}
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+}
+
+$("start-btn").addEventListener("click", startTask);
+$("stop-btn").addEventListener("click", stopTask);
+$("url").addEventListener("keydown", (e) => { if (e.key === "Enter") startTask(); });
+$("pause-btn").addEventListener("click", () => {
+  logPaused = !logPaused;
+  $("log").classList.toggle("paused", logPaused);
+  $("pause-btn").textContent = logPaused ? "继续滚动" : "暂停滚动";
+});
+$("log").addEventListener("scroll", () => {
+  const el = $("log");
+  logAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+});
+
+loadTasks();
+loadSession();
+</script>
+</body>
+</html>

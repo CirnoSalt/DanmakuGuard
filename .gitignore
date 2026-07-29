@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 配置（含敏感 Cookie / 个人配置，切勿上传）
+config.yaml
+accounts.yaml
+
+# 日志
+logs/
+
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+# IDE
+.trae/
+.vscode/
+.idea/
+
+# 系统文件
+Thumbs.db
+.DS_Store

@@ -1,0 +1,30 @@
+# 复制本文件为 config.yaml 并填写真实信息
+# B站账号 Cookie 请配置在 accounts.yaml（参考 accounts.example.yaml）
+
+bilibili:
+  accounts_path: "accounts.yaml"      # 账号列表文件路径（多账号轮换）
+  all_limited_wait: 300.0             # 所有账号都风控时的等待循环间隔（秒）
+  request_interval: 7.5               # 举报间默认间隔（秒），实际等待为该值 ±2.5 秒随机
+  max_retries: 3                      # 单次请求最大重试次数
+  segment_cap: 30                     # 弹幕分段拉取熔断上限
+
+ai:
+  base_url: "https://api.openai.com/v1"   # 可替换为任意 OpenAI 兼容 API
+  api_key: "sk-xxx"                        # API Key（本地部署可填任意值）
+  model: "gpt-4o-mini"                     # 模型名，如 gpt-4o-mini、qwen3-...
+  batch_size: 10                    # 每批发送给 AI 的弹幕条数
+  temperature: 0.0                  # AI 温度，0 为确定输出（思考型模型建议保持 0）
+  confidence_threshold: 0.6         # 低于该置信度不举报
+  max_tokens: 2000                  # 仅容纳 JSON 输出；过大会鼓励思考型模型展开推理
+  timeout: 120.0                    # 单次 AI 调用超时秒数
+  reasoning_effort: "minimal"       # 思考型模型推理深度：minimal/low/medium/high；留空则不发送（兼容不支持该参数的 API）
+
+report:
+  default_reason: 7                 # AI 仅返回 true/false 时使用的默认举报理由（7=引战）
+  dedup_by_content: true            # 相同内容合并送审，命中后举报全部 dmid
+  max_reports: 0                    # 单任务举报上限，0 表示不限；设为正数可防风控
+  dictionary_path: "dict/banned_words.yaml"  # 违禁词词典路径，不存在则禁用预过滤
+
+server:
+  host: "127.0.0.1"                 # 监听地址
+  port: 8000                        # 监听端口
