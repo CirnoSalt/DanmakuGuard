@@ -88,6 +88,10 @@ async def lifespan(app: FastAPI):
         )
 
     analyzer = AIAnalyzer(s.ai)
+    # 启动时探测 AI 模型连通性：无法连接则自动切换为纯字典模式（仅词典预过滤）
+    ai_available = await analyzer.check_connectivity()
+    if not ai_available:
+        log.warning("已配置的 AI 模型无法连接，自动切换为纯字典模式（仅使用词典预过滤）")
 
     # 加载违禁词词典（用于 AI 审查前的本地预过滤）
     dictionary = BannedDictionary()
@@ -95,15 +99,26 @@ async def lifespan(app: FastAPI):
     if dict_count > 0:
         log.info("违禁词预过滤已启用：%d 条词条", dict_count)
 
-    tm = TaskManager(s, bili, analyzer, dictionary, account_manager)
+    mode = "ai" if ai_available else "dictionary"
+    if not ai_available and dict_count <= 0:
+        log.warning("纯字典模式下未加载任何违禁词，将不会举报任何弹幕")
+
+    tm = TaskManager(s, bili, analyzer, dictionary, account_manager, use_ai=ai_available)
     await tm.start()
 
     app.state.settings = s
     app.state.task_manager = tm
     app.state.bili_client = bili
     app.state.account_manager = account_manager
+    app.state.mode = mode
+    app.state.ai_available = ai_available
+    app.state.dictionary_enabled = dict_count > 0
+    app.state.dictionary_count = dict_count
 
-    log.info("服务启动完成，监听 %s:%s", s.server.host, s.server.port)
+    log.info(
+        "服务启动完成，运行模式=%s，监听 %s:%s",
+        mode, s.server.host, s.server.port,
+    )
     yield
 
     await tm.shutdown()

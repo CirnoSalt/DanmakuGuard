@@ -87,6 +87,42 @@ class AIAnalyzer:
         )
         # 持有底层 httpx client，停止任务时可直接 aclose() 中断进行中的请求
         self._httpx_client = self.client._client
+        # 模型连通性标记：启动探测失败时置 False，任务处理自动退化为纯字典模式
+        self.available: bool = False
+
+    async def check_connectivity(self) -> bool:
+        """启动时探测配置的模型是否可连接。
+
+        探测使用独立的短超时客户端发起一次极小 chat 补全（不干扰日常分析用的主客户端），
+        能同时验证 base_url 可达性与配置的 model 是否可用。探测失败则标记 available=False，
+        上层据此自动切换为纯字典模式。
+        """
+        probe = AsyncOpenAI(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            timeout=min(self.config.timeout, 20.0),
+            max_retries=0,
+        )
+        try:
+            resp = await probe.chat.completions.create(
+                model=self.config.model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            self.available = bool(resp.choices)
+            if self.available:
+                logger.info("AI 模型连通性探测成功：%s", self.config.model)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.available = False
+            logger.warning("AI 模型连通性探测失败，将自动切换为纯字典模式：%s", exc)
+        finally:
+            try:
+                await probe.close()
+            except Exception:
+                pass
+        return self.available
 
     def aclose(self) -> None:
         """强制关闭底层 HTTP transport，中断所有进行中的 AI 请求。

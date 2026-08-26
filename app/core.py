@@ -50,7 +50,7 @@ class TaskStats:
     total: int = 0          # 弹幕总数（原始 dmid 数）
     analyzed: int = 0       # 已分析的 dmid 数（与 total 同口径）
     violating: int = 0      # 判定违规的 dmid 数
-    reported: int = 0       # 已尝试举报的条数
+    reported: int = 0       # 已成功举报的条数（仅统计成功，作为 max_reports 上限判定）
     success: int = 0        # 举报成功
     failed: int = 0         # 举报失败
     skipped: int = 0        # 因停止/上限未处理的
@@ -77,6 +77,12 @@ class Task:
     loop_round: int = 0
     # 用于唤醒正在 await AI/B站接口的 worker，实现快速停止
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # 跨轮去重（循环模式下跨轮保留，避免重复分析/举报）：
+    # seen_dmids 已拉取过的 dmid；reported_dmids 已成功举报的 dmid；
+    # content_report_count 各内容已成功举报的次数（用于重复弹幕账号轮换）。
+    seen_dmids: set[int] = field(default_factory=set)
+    reported_dmids: set[int] = field(default_factory=set)
+    content_report_count: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -404,11 +410,14 @@ class TaskManager:
         analyzer: AIAnalyzer,
         dictionary: BannedDictionary | None = None,
         account_manager: "AccountManager | None" = None,
+        use_ai: bool = True,
     ):
         self.settings = settings
         self.bili = bili
         self.analyzer = analyzer
         self.dictionary = dictionary or BannedDictionary()
+        # 模型不可用（启动探测失败）时置 False，任务处理退化为纯字典模式
+        self.use_ai = use_ai
         self.account_manager = account_manager
         self.tasks: dict[str, Task] = {}
         self._queue: asyncio.Queue[str] = asyncio.Queue()
@@ -540,6 +549,7 @@ class TaskManager:
                 return
 
             # 循环模式：每轮处理完毕后重置部分统计并重新拉取弹幕
+            max_reports = self.settings.report.max_reports
             while True:
                 round_no = task.loop_round + 1
                 if task.loop_mode:
@@ -555,6 +565,14 @@ class TaskManager:
                     break
 
                 if task.stop_requested:
+                    break
+
+                # 达到全局举报上限：结束循环，避免下一轮空转
+                if max_reports > 0 and task.stats.reported >= max_reports:
+                    await bus.log(
+                        task_id, "info",
+                        f"已达全局举报上限 {max_reports} 条，循环结束",
+                    )
                     break
 
                 if not should_continue:
@@ -623,6 +641,15 @@ class TaskManager:
         danmaku = await fetch_all_danmaku(
             self.bili, info["cid"], self.settings.bilibili.segment_cap
         )
+        # 循环模式：仅处理本轮「新增」弹幕（尚未见过的 dmid），避免跨轮重复分析与举报
+        if task.loop_mode:
+            new_danmaku = [d for d in danmaku if d.id not in task.seen_dmids]
+            task.seen_dmids.update(d.id for d in danmaku)
+            danmaku = new_danmaku
+            await bus.log(
+                task_id, "info",
+                f"本轮新增弹幕 {len(danmaku)} 条（累计已见 {len(task.seen_dmids)}）",
+            )
         task.stats.total = len(danmaku)
         await bus.log(task_id, "info", f"共拉取弹幕 {len(danmaku)} 条")
         await bus.stats(task_id, stats_to_dict(task.stats))
@@ -651,7 +678,6 @@ class TaskManager:
         max_reports = self.settings.report.max_reports
 
         cooldown = CooldownManager(self.settings.bilibili.request_interval)
-        reported_dmids: set[int] = set()
 
         if max_reports > 0:
             await bus.log(
@@ -689,11 +715,11 @@ class TaskManager:
                         content = item["content"]
                         dmids = content_to_dmids[content]
                         for dmid in dmids:
-                            await self._report_one(task, dmid, m.reason, item["content"], cooldown, reported_dmids)
+                            await self._report_one(task, dmid, m.reason, item["content"], cooldown)
                             dict_violating_dmids += 1
                         dict_analyzed_dmids += len(dmids)
                     else:
-                        await self._report_one(task, item["id"], m.reason, item["content"], cooldown, reported_dmids)
+                        await self._report_one(task, item["id"], m.reason, item["content"], cooldown)
                         dict_violating_dmids += 1
                         dict_analyzed_dmids += 1
                 else:
@@ -717,6 +743,23 @@ class TaskManager:
 
         if not audit_items:
             await bus.log(task.id, "info", "无需送 AI 分析的弹幕")
+            await self._log_report_summary(task)
+            return
+
+        # ---- 纯字典模式：模型不可用时不送 AI，剩余未命中词典的弹幕视为不违规 ----
+        if not self.use_ai:
+            remaining_dmids = 0
+            for item in audit_items:
+                if content_to_dmids is not None:
+                    remaining_dmids += len(content_to_dmids[item["content"]])
+                else:
+                    remaining_dmids += 1
+            task.stats.analyzed += remaining_dmids
+            await bus.log(
+                task.id, "info",
+                f"纯字典模式：未命中词典的 {remaining_dmids} 条 dmid 视为不违规",
+            )
+            await bus.stats(task.id, stats_to_dict(task.stats))
             await self._log_report_summary(task)
             return
 
@@ -794,7 +837,7 @@ class TaskManager:
                     # 排除 8(剧透) 和 10(视频无关)：AI 无法判断这两类
                     reason = r.reason if r.reason in {1, 2, 3, 4, 5, 6, 7, 9, 11, 12} else default_reason
                     for dmid in dmids:
-                        await self._report_one(task, dmid, reason, content, cooldown, reported_dmids)
+                        await self._report_one(task, dmid, reason, content, cooldown)
                         batch_violating += 1
 
             task.stats.analyzed += batch_analyzed_dmids
@@ -886,9 +929,8 @@ class TaskManager:
         reason: int,
         content: str,
         cooldown: CooldownManager,
-        reported_dmids: set[int],
     ) -> None:
-        if dmid in reported_dmids:
+        if dmid in task.reported_dmids:
             return
         # 已达举报上限：跳过并计入 skipped
         max_reports = self.settings.report.max_reports
@@ -901,6 +943,13 @@ class TaskManager:
             task.stats.skipped += 1
             await bus.stats(task.id, stats_to_dict(task.stats))
             return
+
+        # 内容重复弹幕的账号轮换：同一内容已被举报过 k 次时，本次换用其它可用账号提交，
+        # 以规避单个账号对同一弹幕内容只能产生一次有效举报的限制。
+        # （仅当配置了多个账号且内容非空时生效；单账号场景下仍按同账号提交。）
+        if content and self.account_manager is not None and self.account_manager.total > 1:
+            k = task.content_report_count.get(content, 0)
+            self.account_manager.switch_for_content(k)
 
         # 普通业务错误的重试次数（不含风控/Cookie 问题）
         max_attempts = 3
@@ -915,12 +964,13 @@ class TaskManager:
                 await report_danmaku(
                     self.bili, task.cid, dmid, reason, content=content
                 )
-                reported_dmids.add(dmid)
+                task.reported_dmids.add(dmid)
                 task.stats.reported += 1
                 task.stats.success += 1
                 cooldown.on_success()
                 if self.account_manager:
                     self.account_manager.on_success()
+                task.content_report_count[content] = task.content_report_count.get(content, 0) + 1
                 await bus.log(
                     task.id, "info",
                     f"举报成功 dmid={dmid} reason={reason}",
@@ -978,7 +1028,7 @@ class TaskManager:
                 task.stop_event.set()
                 raise
             except BiliAPIError as e:
-                task.stats.reported += 1
+                # 业务失败（如“已举报”）不占用有效举报上限，仅计入 failed
                 task.stats.failed += 1
                 if self.account_manager:
                     self.account_manager.on_fail()
@@ -991,7 +1041,7 @@ class TaskManager:
             except Exception as e:
                 attempt += 1
                 if attempt >= max_attempts:
-                    task.stats.reported += 1
+                    # 重试耗尽：业务失败不占用有效举报上限，仅计入 failed
                     task.stats.failed += 1
                     if self.account_manager:
                         self.account_manager.on_fail()

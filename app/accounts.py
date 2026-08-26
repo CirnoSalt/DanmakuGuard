@@ -88,10 +88,10 @@ class AccountManager:
         等到最早解限的账号恢复后切换；返回 True 表示等待后已恢复。
         """
         async with self._lock:
-            # 标记当前账号风控，默认冷却 5 分钟
+            # 标记当前账号风控，冷却时长使用配置 all_limited_wait
             now = time.time()
             current = self._states[self._current_idx]
-            current.limited_until = now + 300.0
+            current.limited_until = now + max(1.0, self._config.all_limited_wait)
             logger.warning(
                 "账号 %s 触发风控，标记冷却至 %s",
                 current.cookie.name,
@@ -125,33 +125,25 @@ class AccountManager:
         return None
 
     async def _wait_for_any_available(self) -> None:
-        """所有账号风控时，等待最早解限的账号到期后恢复。"""
-        now = time.time()
-        # 计算最早解限时间
-        earliest = min(s.limited_until for s in self._states)
-        wait = max(1.0, earliest - now)
+        """所有账号风控时，按配置间隔轮询等待任一账号解限后恢复。"""
+        interval = max(1.0, self._config.all_limited_wait)
         logger.warning(
-            "所有 %d 个账号均已风控，等待 %.0fs 后恢复（最早解限时间 %s）",
-            self.total, wait,
-            time.strftime("%H:%M:%S", time.localtime(earliest)),
+            "所有 %d 个账号均已风控，以 %.0fs 间隔轮询等待可用账号",
+            self.total, interval,
         )
-        await asyncio.sleep(wait)
-        # 等待结束后，选择最早解限的账号
-        now = time.time()
-        # 重新计算：可能有账号已经自然解限
-        available = [s for s in self._states if not s.is_limited]
-        if available:
-            target = available[0]
-        else:
-            # 仍有账号在风控，选最早解限的（可能刚到期）
-            target = min(self._states, key=lambda s: s.limited_until)
-        self._current_idx = self._states.index(target)
-        self._bili.switch_cookie(
-            target.cookie.sessdata,
-            target.cookie.bili_jct,
-            target.cookie.name,
-        )
-        logger.info("等待结束，恢复使用账号：%s", target.cookie.name)
+        while True:
+            await asyncio.sleep(interval)
+            # 等待结束后重新检查：可能有账号已自然解限
+            for i, state in enumerate(self._states):
+                if not state.is_limited:
+                    self._current_idx = i
+                    self._bili.switch_cookie(
+                        state.cookie.sessdata,
+                        state.cookie.bili_jct,
+                        state.cookie.name,
+                    )
+                    logger.info("等待结束，恢复使用账号：%s", state.cookie.name)
+                    return
 
     def on_success(self) -> None:
         """举报成功时调用，更新当前账号统计。"""
@@ -160,6 +152,35 @@ class AccountManager:
     def on_fail(self) -> None:
         """举报失败时调用（非风控类失败）。"""
         self._states[self._current_idx].fail_count += 1
+
+    def switch_for_content(self, k: int) -> bool:
+        """对「内容重复的弹幕」按内容已举报次数做账号轮换。
+
+        单个账号对同一弹幕内容通常只能产生一次有效举报，借助多个账号即可让
+        重复内容逐个生效。从 (k % 账号数) 起向后寻找第一个「未风控且非当前使用」
+        的账号切换；找不到可切换账号时保持当前账号尽力提交。
+        返回是否真正切换成功。
+        """
+        n = len(self._states)
+        start = k % n
+        for offset in range(n):
+            idx = (start + offset) % n
+            if self._states[idx].is_limited:
+                continue
+            if idx == self._current_idx:
+                # 尽量避免继续用当前账号提交同一个重复内容
+                continue
+            self._current_idx = idx
+            state = self._states[idx]
+            self._bili.switch_cookie(
+                state.cookie.sessdata,
+                state.cookie.bili_jct,
+                state.cookie.name,
+            )
+            logger.info("内容级账号轮换：切换至账号 %s 提交该条重复弹幕", state.cookie.name)
+            return True
+        # 其余账号均已风控：保持当前账号尽力提交
+        return False
 
     def status(self) -> list[dict]:
         """返回所有账号状态，供前端展示。"""

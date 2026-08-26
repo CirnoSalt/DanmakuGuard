@@ -45,6 +45,16 @@ def create_router() -> APIRouter:
         tm = request.app.state.task_manager
         return tm.session_stats()
 
+    @r.get("/api/status")
+    async def status(request: Request):
+        st = request.app.state
+        return {
+            "mode": getattr(st, "mode", "ai"),
+            "ai_available": bool(getattr(st, "ai_available", True)),
+            "dictionary_enabled": bool(getattr(st, "dictionary_enabled", False)),
+            "dictionary_count": getattr(st, "dictionary_count", 0),
+        }
+
     @r.get("/api/accounts")
     async def accounts(request: Request):
         am = getattr(request.app.state, "account_manager", None)

@@ -219,13 +219,53 @@ def parse_dm_seg(data: bytes) -> list[DanmakuElem]:
 # =====================================================================
 
 _BV_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
+# av 号：数字前需为「非字母数字」边界，避免误伤普通文本中的 av 字样
+_AV_RE = re.compile(r"(?<![A-Za-z0-9])av(\d+)", re.IGNORECASE)
+
+# ---- av/bv 互转（B站现行 base58 算法，av 上限 2^51，来自官方 JS 实现）----
+_B58_TABLE = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf"
+_XOR_CODE = 23442827791579
+_MASK_CODE = (1 << 51) - 1
+_MAX_AID = 1 << 51
+
+
+def _bv2av(bvid: str) -> int:
+    arr = list(bvid)
+    arr[3], arr[9] = arr[9], arr[3]
+    arr[4], arr[7] = arr[7], arr[4]
+    tmp = 0
+    for c in arr[3:]:
+        tmp = tmp * 58 + _B58_TABLE.index(c)
+    return (tmp & _MASK_CODE) ^ _XOR_CODE
+
+
+def _av2bv(avid: int) -> str:
+    arr = ['B', 'V', '1', '0', '0', '0', '0', '0', '0', '0', '0', '0']
+    bv_idx = len(arr) - 1
+    tmp = (_MAX_AID | int(avid)) ^ _XOR_CODE
+    while tmp > 0:
+        arr[bv_idx] = _B58_TABLE[tmp % 58]
+        tmp //= 58
+        bv_idx -= 1
+    arr[3], arr[9] = arr[9], arr[3]
+    arr[4], arr[7] = arr[7], arr[4]
+    return "".join(arr)
 
 
 def extract_bvid(url_or_bv: str) -> str:
-    m = _BV_RE.search(url_or_bv.strip())
-    if not m:
-        raise ValueError(f"无法从输入中解析 BV 号: {url_or_bv}")
-    return m.group(1)
+    """从链接或编号中解析视频标识，统一返回 BV 号。
+
+    同时支持 BV 号与 av 号输入（如 .../video/BV1xx... 或 .../video/av117149813182185/），
+    av 号会自动转换为对应 BV 号。
+    """
+    s = url_or_bv.strip()
+    m = _BV_RE.search(s)
+    if m:
+        return m.group(1)
+    m = _AV_RE.search(s)
+    if m:
+        return _av2bv(int(m.group(1)))
+    raise ValueError(f"无法从输入中解析 BV 号或 av 号: {url_or_bv}")
 
 
 async def get_video_info(client: BiliClient, bvid: str) -> dict:
