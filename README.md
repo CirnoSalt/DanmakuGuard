@@ -176,7 +176,6 @@ accounts:
 - 两个值必须来自**同一个账号**：`SESSDATA` 与 `bili_jct` 不匹配会在举报时报 csrf 校验失败（程序会提示该账号失效并退出轮换）
 - 值较长（`SESSDATA` 常超过 100 字符），务必复制完整；改完记得**重启程序**生效
 - 其他浏览器路径相同（Edge 与 Chrome 一致；Firefox 为 存储 → Cookie）
-- `accounts.yaml` 与 `config.yaml` 已在 `.gitignore` 中，不会被提交到仓库
 
 #### AI API（可选）
 
