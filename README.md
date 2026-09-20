@@ -210,7 +210,7 @@ AI 开销由三部分构成：**系统提示词**（每次请求的固定开销�
 | 精简系统提示词 | 470 → 319 tokens（−32%） |
 | 送审内容紧凑 JSON（去空格） | 输入 token 降低 3~5% |
 | `report.dedup_by_content` 内容去重 | 相同弹幕只花一次额度（实测 15310 条 → 11045 条送审） |
-| `extra_body.reasoning.enabled: false` 关掉思考 | 输出 token 361 → 69（−81%），**召回不变（实测 3/3）** |
+| `extra_body.reasoning.enabled: false` 关掉思考 | 输出 token 361 → 69（−81%），判定结果不受影响 |
 | `batch_size` 由 5 提到 15 | 请求数 2209 → 737（−67%），系统提示词开销同步下降 |
 | `report.max_reports` 设上限 | 达到上限即停止送审，避免为剩余弹幕白花额度 |
 
