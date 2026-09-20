@@ -28,6 +28,9 @@
   - [自行打包 exe](#方式三自行打包-exe)
   - [配置](#配置)
     - [两种运行模式](#两种运行模式)
+    - [B站账号 Cookie](#b站账号-cookie必填)
+    - [AI API](#ai-api可选)
+    - [举报限制](#举报限制建议)
   - [使用流程](#使用流程)
 - [配置项说明](#配置项说明)
 - [风控与冷却策略](#风控与冷却策略)
@@ -133,26 +136,49 @@ python run.py
 - 纯字典模式**零 API 成本、无额度限制、可完全离线运行**，适合长期挂机或不想配 AI 的场景
 - 当前控制台顶部会显示实际运行模式；纯字典模式的覆盖面取决于词典词条数量，可按需扩充
 
-#### B站账号 Cookie（必填，`accounts.yaml`）
+#### B站账号 Cookie（必填）
 
-打开浏览器登录 B站，F12 → Application/存储 → Cookies → `bilibili.com`，复制以下两个值填入 `accounts.yaml`：
+**准备**：建议用**小号**获取 Cookie（举报存在被风控的风险），并在**普通窗口**中登录——无痕窗口关闭后 Cookie 会失效。
 
-- `SESSDATA`
-- `bili_jct`（CSRF Token，举报时必需）
+**在 Chrome 中复制 Cookie**：
 
-支持配置多个账号轮换，触发风控自动切换下一个账号：
+1. 打开 <https://www.bilibili.com>，确认已登录
+2. 按 `F12` 打开开发者工具（或页面右键 → 检查）
+3. 切换到 **Application / 应用程序** 面板（标签栏看不到就点 `»` 展开）
+4. 左侧依次展开 **Storage / 存储 → Cookies → `https://www.bilibili.com`**
+5. 右侧列表中找到 **`SESSDATA`** 与 **`bili_jct`** 两行，选中 `Value` 列复制（双击可全选）
+
+```
+Application / 应用程序
+└─ Storage / 存储
+   └─ Cookies
+      └─ https://www.bilibili.com     ← 点这一行
+         Name        Value
+         SESSDATA    xxxxxxxx…        ← 复制整段值
+         bili_jct    yyyyyyyy…        ← 复制整段值
+```
+
+6. 粘贴到 `accounts.yaml`：**只填值本身**，不要带 `SESSDATA=` 前缀、引号或多余空格
 
 ```yaml
 accounts:
   - name: 账号1
-    sessdata: "xxx"
-    bili_jct: "yyy"
-  - name: 账号2
+    sessdata: "第 5 步复制的 SESSDATA 值"
+    bili_jct: "第 5 步复制的 bili_jct 值"
+  - name: 账号2        # 多账号轮换：重复上述步骤再填一组
     sessdata: "xxx"
     bili_jct: "yyy"
 ```
 
-#### AI API（可选，`config.yaml`）
+**常见坑**：
+
+- `SESSDATA` 里会出现 `%2C`、`%2A` 这类百分号编码，**原样粘贴**即可，不要手动解码
+- 两个值必须来自**同一个账号**：`SESSDATA` 与 `bili_jct` 不匹配会在举报时报 csrf 校验失败（程序会提示该账号失效并退出轮换）
+- 值较长（`SESSDATA` 常超过 100 字符），务必复制完整；改完记得**重启程序**生效
+- 其他浏览器路径相同（Edge 与 Chrome 一致；Firefox 为 存储 → Cookie）
+- `accounts.yaml` 与 `config.yaml` 已在 `.gitignore` 中，不会被提交到仓库
+
+#### AI API（可选）
 
 填写任意 OpenAI 兼容 API 后由 AI 参与判定，**留空或连不上即使用纯字典模式**（控制台与日志会给出提示）：
 

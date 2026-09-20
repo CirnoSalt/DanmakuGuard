@@ -1,10 +1,14 @@
 # B站账号列表 - 多账号轮换，触发风控自动切换下一个账号
 # 复制本文件为 accounts.yaml 并填写真实 Cookie
 #
-# 获取 Cookie 方法：
-#   1. 浏览器登录 b站（建议使用小号）
-#   2. F12 打开开发者工具 → Application/存储 → Cookies → bilibili.com
-#   3. 复制 SESSDATA 和 bili_jct 两个值填到下方
+# 获取 Cookie（以 Chrome 为例，建议用小号、普通窗口而非无痕窗口）：
+#   1. 打开 bilibili.com 并确认已登录 → 按 F12 打开开发者工具
+#   2. 切到 Application / 应用程序 → 左侧 Storage / 存储 → Cookies → https://www.bilibili.com
+#   3. 在右侧列表中分别复制 SESSDATA 与 bili_jct 的 Value
+#      - 只复制值本身，不要带 "SESSDATA=" 前缀、引号或空格
+#      - 值里的 %2C %2A 等百分号编码原样保留，不要手动解码
+#      - 两个值必须来自同一个账号，否则举报时会报 csrf 校验失败
+#   4. 粘贴到下方对应字段，保存后重启程序生效（启动时会校验登录态并写明失败原因）
 #
 # 至少配置 1 个账号；多账号时触发风控会自动切换，所有账号都风控则等待循环
 accounts:
