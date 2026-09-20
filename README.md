@@ -16,7 +16,7 @@
 
 ---
 
-> 基于 Web + 后端的 B站弹幕自动审核举报工具。通过接入 OpenAI 兼容的 AI API，自动分析视频内全部弹幕，识别违规内容并批量提交举报。提供 Windows 免安装包（[Releases](https://github.com/CirnoSalt/DanmakuGuard/releases/latest) 下载即用），也支持源码运行与自行打包。
+> 基于 Web + 后端的 B站弹幕自动审核举报工具。接入 OpenAI 兼容的 AI API 后自动分析视频内全部弹幕、识别违规内容并批量提交举报；**也可以完全不配 AI**——纯字典模式仅依赖本地违禁词词典，零 API 成本、可离线运行。提供 Windows 免安装包（[Releases](https://github.com/CirnoSalt/DanmakuGuard/releases/latest) 下载即用），也支持源码运行与自行打包。
 
 ## 目录
 
@@ -27,6 +27,7 @@
   - [源码运行](#方式二源码运行)
   - [自行打包 exe](#方式三自行打包-exe)
   - [配置](#配置)
+    - [两种运行模式](#两种运行模式)
   - [使用流程](#使用流程)
 - [配置项说明](#配置项说明)
 - [风控与冷却策略](#风控与冷却策略)
@@ -41,6 +42,7 @@
 ## 功能特性
 
 - **一键处理**：输入视频链接，自动完成 拉取弹幕 → AI 分析 → 批量举报 全流程
+- **AI 可选，零成本也能跑**：不配置任何 AI API 即可使用纯字典模式，仅凭本地违禁词词典完成审核举报——离线可用、无 API 费用与额度限制；配置 AI 后自动升级为「AI + 词典」双通道
 - **OpenAI 兼容**：支持任意 OpenAI 标准 API（LM Studio / Ollama / DeepSeek / 官方等）
 - **智能分析**：AI 按固定提示词判断每条弹幕是否违规，返回违规类型与置信度
 - **去重送审**：相同内容弹幕自动合并送审，命中后举报全部重复弹幕
@@ -118,6 +120,19 @@ python run.py
 
 ### 配置
 
+配置分两部分：**B站账号 Cookie 必填，AI API 可选**——不配 AI 也能正常使用（见下方运行模式）。
+
+#### 两种运行模式
+
+| 模式 | 触发条件 | 能举报什么 |
+|------|----------|------------|
+| AI + 词典 | 配置了可用的 AI API | 词典命中项 + AI 判定违规的弹幕 |
+| **纯字典** | 未配置 AI，或启动时探活失败 | 仅词典命中项（[`dict/banned_words.yaml`](dict/banned_words.yaml)） |
+
+- 启动时会自动探测 AI 连通性，连不上就**自动降级为纯字典模式**，无需改配置
+- 纯字典模式**零 API 成本、无额度限制、可完全离线运行**，适合长期挂机或不想配 AI 的场景
+- 当前控制台顶部会显示实际运行模式；纯字典模式的覆盖面取决于词典词条数量，可按需扩充
+
 #### B站账号 Cookie（必填，`accounts.yaml`）
 
 打开浏览器登录 B站，F12 → Application/存储 → Cookies → `bilibili.com`，复制以下两个值填入 `accounts.yaml`：
@@ -139,7 +154,7 @@ accounts:
 
 #### AI API（可选，`config.yaml`）
 
-填写任意 OpenAI 兼容 API 后由 AI 参与判定；**不填或连不上时程序会自动降级为纯字典模式**（仅举报命中违禁词词典的弹幕），控制台与日志会给出提示。
+填写任意 OpenAI 兼容 API 后由 AI 参与判定，**留空或连不上即使用纯字典模式**（控制台与日志会给出提示）：
 
 - `ai.base_url`：API 地址，如 `https://api.openai.com/v1`、`http://localhost:1234/v1`
 - `ai.api_key`：API Key（本地部署可填任意值）
@@ -176,12 +191,15 @@ accounts:
 | `ai.timeout` | 120 | 单次 AI 调用超时秒数 |
 | `ai.confidence_threshold` | 0.6 | 低于该置信度不举报 |
 | `ai.temperature` | 0.0 | AI 温度，0 为确定输出 |
+| `ai.extra_body` | 无 | 透传给接口的额外字段，如关闭思考 `{reasoning: {enabled: false}}` |
 | `report.dedup_by_content` | true | 相同内容合并送审 |
 | `report.default_reason` | 7 | AI 未给理由时的默认举报理由（7=引战）|
 | `report.max_reports` | 0 | 单任务举报上限，0 不限 |
 | `report.dictionary_path` | `dict/banned_words.yaml` | 违禁词词典路径，不存在则禁用预过滤 |
 | `server.host` | 127.0.0.1 | 监听地址 |
 | `server.port` | 8000 | 监听端口 |
+
+> `ai.*` 全部为可选项：未配置（或配置后探活失败）时程序进入纯字典模式，仅使用 `report.dictionary_path` 指定的词典。
 
 </details>
 
@@ -205,7 +223,9 @@ accounts:
 
 ## 省 token 与额度
 
-AI 开销由三部分构成：**系统提示词**（每次请求的固定开销）、**送审内容**、**模型输出**。当前实现的优化与实测效果：
+> 不配置 AI 时本节不适用：纯字典模式没有任何 API 调用与 token 消耗。
+
+使用 AI 时，开销由三部分构成：**系统提示词**（每次请求的固定开销）、**送审内容**、**模型输出**。当前实现的优化与效果：
 
 | 优化项 | 效果 |
 |--------|------|
