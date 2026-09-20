@@ -6,6 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Release](https://img.shields.io/github/v/release/CirnoSalt/DanmakuGuard?display_name=tag&sort=semver)](https://github.com/CirnoSalt/DanmakuGuard/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)]()
 [![GitHub Stars](https://img.shields.io/github/stars/CirnoSalt/DanmakuGuard?style=social)](https://github.com/CirnoSalt/DanmakuGuard)
 [![GitHub Forks](https://img.shields.io/github/forks/CirnoSalt/DanmakuGuard?style=social)](https://github.com/CirnoSalt/DanmakuGuard)
@@ -15,17 +16,22 @@
 
 ---
 
-> 基于 Web + 后端的 B站弹幕自动审核举报工具。通过接入 OpenAI 兼容的 AI API，自动分析视频内全部弹幕，识别违规内容并批量提交举报。支持源码运行与一键打包为 Windows 可执行文件。
+> 基于 Web + 后端的 B站弹幕自动审核举报工具。通过接入 OpenAI 兼容的 AI API，自动分析视频内全部弹幕，识别违规内容并批量提交举报。提供 Windows 免安装包（[Releases](https://github.com/CirnoSalt/DanmakuGuard/releases/latest) 下载即用），也支持源码运行与自行打包。
 
 ## 目录
 
 - [功能特性](#功能特性)
 - [环境要求](#环境要求)
 - [快速开始](#快速开始)
-  - [源码运行](#方式一源码运行)
-  - [打包 exe](#方式二使用打包好的-exe)
+  - [下载免安装包](#方式一下载免安装包推荐)
+  - [源码运行](#方式二源码运行)
+  - [自行打包 exe](#方式三自行打包-exe)
+  - [配置](#配置)
+  - [使用流程](#使用流程)
 - [配置项说明](#配置项说明)
 - [风控与冷却策略](#风控与冷却策略)
+- [省 token 与额度](#省-token-与额度)
+- [违禁词词典](#违禁词词典)
 - [举报理由代码](#举报理由代码)
 - [日志](#日志)
 - [注意事项](#注意事项)
@@ -46,18 +52,28 @@
 - **状态可视**：控制台顶部实时显示运行模式（AI + 词典 / 纯字典）与每个账号的可用状态、冷却倒计时；刷新页面会自动接管进行中的任务
 - **可随时停止**：能即时中断进行中的 AI 调用；在运行窗口按 Ctrl+C 也会先给任务发停止信号并正常收尾（不会出现"按了停不下来、还在继续举报"）
 - **完善日志**：控制台 + 文件滚动记录，敏感信息自动脱敏
-- **一键打包**：支持 PyInstaller 打包为 `exe`，免 Python 环境分发
+- **开箱即用**：[Releases](https://github.com/CirnoSalt/DanmakuGuard/releases/latest) 提供 Windows 免安装包，解压即用；也支持源码运行与 PyInstaller 自行打包
 
 ## 环境要求
 
 | 运行方式 | 环境要求 |
 |----------|----------|
+| 免安装包（Releases 下载） | Windows 10/11，无需 Python 环境 |
 | 源码运行 | Python 3.11+，Windows / macOS / Linux |
-| 打包产物 | Windows 10/11，无需 Python 环境 |
 
 ## 快速开始
 
-### 方式一：源码运行
+### 方式一：下载免安装包（推荐）
+
+1. 打开 [Releases](https://github.com/CirnoSalt/DanmakuGuard/releases/latest)，下载最新的 `bili_report_vX.Y.Z.zip`
+2. 解压得到 `bili_report/` 目录（含 `bili_report.exe` 与 `_internal/`）
+3. 首次双击 `bili_report.exe`：程序会在 exe 同级目录自动生成 `config.yaml` 与 `accounts.yaml`，随后因账号未填写而报错退出 —— 这是预期行为，按提示操作即可
+4. 参照下方[配置](#配置)填写 `accounts.yaml`（B站 Cookie，必填）与 `config.yaml`（AI 可选）
+5. 再次双击 `bili_report.exe`，浏览器访问 <http://127.0.0.1:8000>
+
+> **升级**：下载新版 zip 解压覆盖程序文件，保留原有的 `config.yaml` / `accounts.yaml` 即可继续使用。
+
+### 方式二：源码运行
 
 #### 1. 安装依赖
 
@@ -69,20 +85,43 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-#### 2. 配置
+#### 2. 准备配置文件
 
-复制示例配置并填写真实信息：
+首次运行需自行复制示例配置，具体填写见下方[配置](#配置)：
 
 ```powershell
 Copy-Item config.example.yaml config.yaml
 Copy-Item accounts.example.yaml accounts.yaml
 ```
 
-需要填写两部分：
+#### 3. 启动
 
-**B站账号 Cookie**（必填，在 `accounts.yaml`）
+```powershell
+python run.py
+```
+
+启动成功后访问：<http://127.0.0.1:8000>
+
+### 方式三：自行打包 exe
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller build_exe.spec --clean --noconfirm
+```
+
+产物位于 `dist/bili_report/`：
+
+- `bili_report.exe`：入口程序
+- `_internal/`：依赖与内置资源（前端页面、违禁词词典、示例配置）
+
+运行方式与方式一相同：首次启动会在 exe 同级目录生成 `config.yaml` 与 `accounts.yaml`；exe 同级的配置优先于内置资源，修改配置无需重新打包。
+
+### 配置
+
+#### B站账号 Cookie（必填，`accounts.yaml`）
 
 打开浏览器登录 B站，F12 → Application/存储 → Cookies → `bilibili.com`，复制以下两个值填入 `accounts.yaml`：
+
 - `SESSDATA`
 - `bili_jct`（CSRF Token，举报时必需）
 
@@ -98,62 +137,26 @@ accounts:
     bili_jct: "yyy"
 ```
 
-**AI API**（必填，在 `config.yaml`）
+#### AI API（可选，`config.yaml`）
 
-填写任意 OpenAI 兼容 API：
+填写任意 OpenAI 兼容 API 后由 AI 参与判定；**不填或连不上时程序会自动降级为纯字典模式**（仅举报命中违禁词词典的弹幕），控制台与日志会给出提示。
+
 - `ai.base_url`：API 地址，如 `https://api.openai.com/v1`、`http://localhost:1234/v1`
 - `ai.api_key`：API Key（本地部署可填任意值）
 - `ai.model`：模型名，如 `gpt-4o-mini`、`qwen3-...`
 
-**举报限制**（建议）
+#### 举报限制（建议）
 
 - `report.max_reports`：单任务举报上限，`0` 为不限。
 
 完整配置示例见 [config.example.yaml](config.example.yaml)。
 
-#### 3. 启动
-
-```powershell
-python run.py
-```
-
-启动成功后访问：<http://127.0.0.1:8000>
-
-### 方式二：使用打包好的 exe
-
-#### 1. 打包
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install pyinstaller
-.\.venv\Scripts\python.exe -m PyInstaller build_exe.spec --clean --noconfirm
-```
-
-产物位于 `dist/bili_report/`：
-- `bili_report.exe`：入口程序
-- `_internal/`：依赖与内置资源（前端页面、违禁词词典、示例配置）
-
-#### 2. 配置
-
-从 `dist/bili_report/_internal/config.example.yaml` 复制一份到 `dist/bili_report/config.yaml`，填写真实 Cookie 与 AI 配置。
-
-> exe 同级目录的 `config.yaml` 优先于内置资源，方便用户编辑而不必重新打包。
-
-#### 3. 运行
-
-双击 `bili_report.exe`，或命令行启动：
-
-```powershell
-.\dist\bili_report\bili_report.exe
-```
-
-浏览器访问 <http://127.0.0.1:8000>。日志会写入 exe 同级目录的 `logs/`。
-
 ### 使用流程
 
-1. 在网页输入框粘贴视频链接（支持 `https://www.bilibili.com/video/BVxxxx` 或纯 BV 号）
+1. 在网页输入框粘贴视频链接（支持 `https://www.bilibili.com/video/BVxxxx`、`.../video/av123456` 或纯 BV/av 号）
 2. 点击「开始」
 3. 实时查看进度：弹幕总数、已分析、违规数、举报成功/失败
-4. 需要时可点击「停止」中断任务（能即时取消进行中的 AI 调用）
+4. 需要时可点击「停止」中断任务（会立即取消进行中的 AI 调用）；也可在运行窗口按 Ctrl+C 退出
 
 ## 配置项说明
 
@@ -200,7 +203,7 @@ python run.py
 
 随机抖动围绕当前冷却中心值浮动，风控升级后抖动也会同步放大，整体节奏自然不固定。
 
-## 省 token / 省额度（实测数据）
+## 省 token 与额度
 
 AI 开销由三部分构成：**系统提示词**（每次请求的固定开销）、**送审内容**、**模型输出**。当前实现的优化与实测效果：
 
@@ -300,7 +303,7 @@ curl -s https://openrouter.ai/api/v1/key -H "Authorization: Bearer <你的 key>"
 - **举报结果带账号名**：日志中的「举报成功 / 举报失败」都会写明是哪个账号提交的，便于确认多账号轮换是否真的生效
 - **弹幕已被处理**：B站返回「该条弹幕已被处理」（如已被他人举报/已删除）时计入「跳过」而不是「失败」，且不会重复提交
 - 统计数据仅保存在内存，重启后清空
-- 打包后修改 `config.yaml` 无需重新打包，重启 exe 即可生效
+- **升级版本**：下载新版 `bili_report_vX.Y.Z.zip` 解压覆盖程序文件，保留原有的 `config.yaml` / `accounts.yaml` 即可；打包版修改 `config.yaml` 无需重新打包，重启 exe 即生效
 
 ## 目录结构
 
@@ -326,12 +329,13 @@ bili_report/
 └── run.py             # 启动入口
 ```
 
-打包产物结构：
+打包产物 / Releases 免安装包结构：
 
 ```
-dist/bili_report/
+bili_report/
 ├── bili_report.exe    # 入口程序
-├── config.yaml        # 用户配置（从 _internal 复制并填写）
+├── config.yaml        # 用户配置（首次启动自动生成，需填写）
+├── accounts.yaml      # 账号列表（首次启动自动生成，需填写）
 ├── logs/              # 运行时自动生成
 └── _internal/
     ├── app/web/static/  # 前端页面（只读资源）
