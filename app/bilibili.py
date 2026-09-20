@@ -43,6 +43,10 @@ class DailyLimitError(BiliAPIError):
     """当日操作上限。"""
 
 
+class DanmakuHandledError(BiliAPIError):
+    """弹幕已被处理（已被别人举报过 / 已删除），无需再次提交。"""
+
+
 class BiliClient:
     def __init__(self, config: BilibiliConfig):
         self.config = config
@@ -69,22 +73,28 @@ class BiliClient:
 
     def switch_cookie(self, sessdata: str, bili_jct: str, name: str = "") -> None:
         """热切换当前账号 Cookie。更新请求头与 CSRF token。"""
+        changed = name != self.current_account_name
         self.current_sessdata = sessdata
         self.current_jct = bili_jct
         self.current_account_name = name
         cookie = f"SESSDATA={sessdata}; bili_jct={bili_jct}"
         self._http.headers["Cookie"] = cookie
-        logger.info("已切换至账号：%s", name or "未命名")
+        # 同一账号重复切换不打日志，避免校验/回滚时刷屏
+        if changed:
+            logger.info("已切换至账号：%s", name or "未命名")
 
     async def aclose(self) -> None:
         await self._http.aclose()
 
     async def _request_with_retry(self, method: str, url: str, **kwargs):
         last_exc: Exception | None = None
+        blocked = False  # 是否被 412 风控页拦截过
         for attempt in range(1, self.config.max_retries + 1):
             try:
                 resp = await self._http.request(method, url, **kwargs)
                 if resp.status_code == 412 or resp.status_code >= 500:
+                    if resp.status_code == 412:
+                        blocked = True
                     raise httpx.HTTPStatusError(
                         f"HTTP {resp.status_code}", request=resp.request, response=resp
                     )
@@ -96,6 +106,9 @@ class BiliClient:
                     "请求 %s 失败(第%d次): %s，%.1fs 后重试", url, attempt, e, wait
                 )
                 await asyncio.sleep(wait)
+        # 412 是 B站的反爬风控页，按风控处理（触发退避/换号），而不是普通业务错误
+        if blocked:
+            raise RateLimitError(412, "HTTP 412 风控拦截，请求多次失败")
         raise BiliAPIError(-1, f"请求多次失败: {last_exc}")
 
     async def get_json(self, path: str, params: dict | None = None) -> dict:
@@ -110,14 +123,35 @@ class BiliClient:
         resp = await self._request_with_retry("GET", path, params=params)
         return resp.content
 
-    async def check_login(self) -> bool:
-        """通过 nav 接口校验 Cookie 登录态。"""
+    async def fetch_login_state(self) -> bool | None:
+        """通过 nav 接口查询登录态。
+
+        返回三态，务必区分后两者：
+        - True ：已登录，Cookie 有效
+        - False：接口明确返回未登录 / Cookie 无效（可据此判定账号失效）
+        - None ：请求失败（网络/超时/接口异常），**无法判定**，不能当作 Cookie 失效，
+                 否则一次网络抖动就会把好账号永久踢出轮换
+
+        包一层三态是为了避免「校验失败 == Cookie 失效」的误判，
+        账号失效是不可逆的标记（本次运行内不再参与轮换），必须证据确凿。
+        """
         try:
             data = await self.get_json("/x/web-interface/nav")
-            return bool(data.get("data", {}).get("isLogin"))
         except Exception as e:
-            logger.error("Cookie 校验失败: %s", e)
+            logger.warning("登录态校验请求失败（无法判定，不标记失效）: %s", e)
+            return None
+
+        code = data.get("code", -1)
+        if code != 0:
+            logger.warning(
+                "登录态校验返回异常：code=%s message=%s", code, data.get("message", "")
+            )
             return False
+        return bool((data.get("data") or {}).get("isLogin"))
+
+    async def check_login(self) -> bool:
+        """是否已登录（无法判定时视为未登录）。"""
+        return await self.fetch_login_state() is True
 
 
 # =====================================================================
@@ -296,6 +330,7 @@ async def fetch_all_danmaku(
 ) -> list[DanmakuElem]:
     """逐段拉取弹幕，遇空停止，超 segment_cap 段熔断。"""
     all_elems: list[DanmakuElem] = []
+    hit_cap = False
     for seg in range(1, segment_cap + 1):
         try:
             content = await client.get_bytes(
@@ -316,8 +351,16 @@ async def fetch_all_danmaku(
             break
 
         all_elems.extend(elems)
+        # 最后一段仍有数据，说明分段数被封顶截断了
+        hit_cap = seg >= segment_cap
         logger.info(
             "弹幕分段 %d: 获取 %d 条，累计 %d 条", seg, len(elems), len(all_elems)
+        )
+
+    if hit_cap:
+        logger.warning(
+            "弹幕分段已达上限 %d 段，超出的弹幕未拉取（长视频可调大 bilibili.segment_cap，"
+            "每段约 6 分钟弹幕）", segment_cap,
         )
 
     logger.info("视频 cid=%s 共拉取弹幕 %d 条", cid, len(all_elems))
@@ -330,8 +373,13 @@ async def fetch_all_danmaku(
 
 # 风控 / 频繁 相关 code
 _RATE_LIMIT_CODES = {-799, 509, -509}
-# 未登录 / 账号封停
-_COOKIE_EXPIRED_CODES = {-101, -102}
+# 未登录 / 账号封停 / CSRF 校验失败（SESSDATA 与 bili_jct 不匹配，等价于凭证失效）
+_COOKIE_EXPIRED_CODES = {-101, -102, -111}
+# 明确的账号凭证失效特征（文案兜底，不同接口文案略有差异）
+_COOKIE_EXPIRED_KEYWORDS = ("未登录", "csrf", "登录已过期", "账号异常", "账号被封", "封禁")
+# 弹幕已被处理（自己/别人已举报过，或弹幕已删除）：无需再提交，也不算失败
+_HANDLED_CODES = {168001, 168002}
+_HANDLED_KEYWORDS = ("已被处理", "已被删除", "已删除", "无需重复")
 # 当日操作上限
 _DAILY_LIMIT_CODES = {36715}
 
@@ -360,8 +408,11 @@ async def report_danmaku(
     if code == 0:
         return data
 
-    if code in _COOKIE_EXPIRED_CODES:
+    lower_msg = msg.lower()
+    if code in _COOKIE_EXPIRED_CODES or any(k in lower_msg for k in _COOKIE_EXPIRED_KEYWORDS):
         raise CookieExpiredError(code, msg)
+    if code in _HANDLED_CODES or any(k in msg for k in _HANDLED_KEYWORDS):
+        raise DanmakuHandledError(code, msg)
     if code in _DAILY_LIMIT_CODES or "上限" in msg:
         raise DailyLimitError(code, msg)
     if code in _RATE_LIMIT_CODES or "频繁" in msg or "风控" in msg:

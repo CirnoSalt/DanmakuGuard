@@ -13,7 +13,10 @@
 """
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-block_cipher = None
+# 注意：PyInstaller 6.x 已移除 bytecode 加密与 win_no_prefer_redirects /
+# win_private_assemblies 参数。这几个参数虽然仍被接受，但只要传的不是 None/False
+# （例如把 block_cipher 设成字符串、把 win_private_assemblies 设成 True），
+# 构建就会直接抛 RemovedCipherFeatureError / 参数已移除错误，因此这里不再传。
 
 # 收集 FastAPI / Uvicorn / OpenAI 等动态导入的子模块
 hiddenimports = []
@@ -50,13 +53,10 @@ a = Analysis(
         "pydoc",
         "doctest",
     ],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,

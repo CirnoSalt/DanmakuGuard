@@ -1,6 +1,7 @@
 """配置加载与校验。"""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +9,8 @@ import yaml
 from pydantic import BaseModel, Field
 
 from app.paths import runtime_path
+
+logger = logging.getLogger("config")
 
 
 class BiliCookie(BaseModel):
@@ -42,6 +45,12 @@ class AIConfig(BaseModel):
     # minimal 适合本场景的快速判定，可避免思考型模型过度推理。
     # 留空则不发送该参数（兼容不支持 reasoning_effort 的 API）。
     reasoning_effort: str = "minimal"
+    # 原样透传给 OpenAI 兼容接口的额外请求体字段（可选，留空则不发）。
+    # 例：LM Studio / vLLM 上关闭 Qwen3 思考，省下思考 token：
+    #   extra_body:
+    #     chat_template_kwargs:
+    #       enable_thinking: false
+    extra_body: dict = Field(default_factory=dict)
 
 
 class ReportConfig(BaseModel):
@@ -72,7 +81,16 @@ def load_settings(path: str | Path = "config.yaml") -> Settings:
         raise FileNotFoundError(
             f"配置文件不存在: {p}，请复制 config.example.yaml 为 config.yaml 并填写"
         )
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    raw = p.read_text(encoding="utf-8")
+    # YAML 语法错误直接抛出，并带上文件路径，避免用户只看到 pydantic 的报错而不知改哪
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as e:
+        raise RuntimeError(f"配置文件 YAML 解析失败：{p}\n{e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"配置文件格式错误：{p} 顶层应为键值映射（如 bilibili: / ai: / report:）"
+        )
     return Settings(**data)
 
 
@@ -87,27 +105,39 @@ def load_accounts(path: str | Path = "accounts.yaml") -> list[BiliCookie]:
           - name: 账号2
             sessdata: xxx
             bili_jct: yyy
+
+    条目缺字段时会跳过并告警（不静默丢弃），避免用户以为已配置却实际未生效。
     """
     p = Path(path)
     if not p.is_absolute():
         p = runtime_path(str(path))
     if not p.exists():
         return []
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    raw = p.read_text(encoding="utf-8")
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as e:
+        # 语法错误必须显式报错：静默返回空列表会让程序回退到单账号模式，更难排查
+        raise RuntimeError(f"账号文件 YAML 解析失败：{p}\n{e}") from e
     # 兼容两种顶层结构：{accounts: [...]} 或直接 [...]
     accounts_data = data.get("accounts") if isinstance(data, dict) else data
     if not isinstance(accounts_data, list):
+        logger.warning("账号文件 %s 中没有 accounts 列表，已忽略", p)
         return []
     result: list[BiliCookie] = []
     for i, item in enumerate(accounts_data, 1):
         if not isinstance(item, dict):
+            logger.warning("账号文件第 %d 项不是键值结构，已跳过", i)
             continue
-        try:
-            result.append(BiliCookie(
-                name=item.get("name") or f"账号{i}",
-                sessdata=item.get("sessdata", ""),
-                bili_jct=item.get("bili_jct", ""),
-            ))
-        except Exception:
+        name = str(item.get("name") or f"账号{i}").strip()
+        # 常见误区：从浏览器复制时带上首尾空白/换行，会让 Cookie 校验失败
+        sessdata = str(item.get("sessdata") or "").strip()
+        bili_jct = str(item.get("bili_jct") or "").strip()
+        if not sessdata or not bili_jct:
+            missing = "、".join(
+                n for n, v in (("sessdata", sessdata), ("bili_jct", bili_jct)) if not v
+            )
+            logger.warning("账号 %s 缺少 %s，已跳过该账号", name, missing)
             continue
+        result.append(BiliCookie(name=name, sessdata=sessdata, bili_jct=bili_jct))
     return result

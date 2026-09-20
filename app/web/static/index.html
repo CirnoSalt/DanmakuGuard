@@ -124,6 +124,10 @@
   td.title { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { color: var(--muted); text-align: center; padding: 20px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .sys-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+  .sys-row .k { color: var(--muted); }
+  .accounts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .hint.warn { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -149,6 +153,14 @@
       <span id="loop-badge" class="badge" style="display:none">循环中</span>
     </div>
     <div class="hint">提示：任务串行执行，提交后会排队；触发风控会自动冷却退避。循环模式下处理完一轮自动重新拉取弹幕继续。</div>
+  </div>
+
+  <div class="card">
+    <div class="sys-row">
+      <span class="k">运行模式：</span><span id="mode-badge" class="badge">检测中</span>
+      <span class="k">账号：</span><span id="accounts" class="accounts"></span>
+    </div>
+    <div class="hint warn" id="mode-hint" style="display:none"></div>
   </div>
 
   <div class="stats">
@@ -189,8 +201,10 @@ let currentTaskId = null;
 let evtSource = null;
 let logPaused = false;
 let logAtBottom = true;
+let streamWarned = false;
 
 const STATUS_TEXT = { queued: "排队中", running: "运行中", done: "完成", stopped: "已停止", failed: "失败" };
+const MODE_TEXT = { ai: "AI + 词典", dictionary: "纯字典模式" };
 
 function setStats(s) {
   if (!s) return;
@@ -250,9 +264,20 @@ function startStream(taskId) {
       $("url").value = "";
       loadTasks();
       loadSession();
+      loadStatus();
     }
   };
-  evtSource.onerror = () => { /* 自动重连，无需处理 */ };
+  evtSource.onopen = () => { streamWarned = false; };
+  evtSource.onerror = () => {
+    // 服务端退出/重启时触发；EventSource 会自动重连，这里只提示一次
+    if (!streamWarned) {
+      streamWarned = true;
+      appendLog(
+        "warning",
+        "与服务端的实时连接已断开，正在自动重连…（若运行窗口已退出，请重新启动程序）"
+      );
+    }
+  };
 }
 
 async function startTask() {
@@ -288,12 +313,22 @@ async function startTask() {
 }
 
 async function stopTask() {
-  if (!currentTaskId) return;
+  if (!currentTaskId) await attachRunningTask();
+  if (!currentTaskId) { appendLog("warning", "当前没有可停止的任务"); return; }
   appendLog("warning", "请求停止任务…");
   try {
-    await fetch(`/api/tasks/${currentTaskId}/stop`, { method: "POST" });
+    const resp = await fetch(`/api/tasks/${currentTaskId}/stop`, { method: "POST" });
+    if (!resp.ok) {
+      appendLog("error", `停止失败：服务返回 ${resp.status}。若运行窗口仍在运行，可再点一次「停止」。`);
+      return;
+    }
+    appendLog("warning", "已发送停止请求，当前这条弹幕处理完就会停下（通常几秒内）。");
   } catch (e) {
-    appendLog("error", `停止请求异常：${e}`);
+    appendLog(
+      "error",
+      "停止请求未送达：服务可能已退出或正在重启。若后台窗口仍在运行，请重新连接后再试；" +
+      "也可以直接在运行窗口按 Ctrl+C 退出（会先停止任务）。"
+    );
   }
 }
 
@@ -329,6 +364,58 @@ async function loadSession() {
   } catch {}
 }
 
+async function loadStatus() {
+  try {
+    const [st, acc] = await Promise.all([
+      fetch("/api/status").then(r => r.json()),
+      fetch("/api/accounts").then(r => r.json()),
+    ]);
+    const mb = $("mode-badge");
+    mb.textContent = MODE_TEXT[st.mode] || st.mode || "-";
+    mb.className = "badge " + (st.ai_available ? "done" : "failed");
+    const hint = $("mode-hint");
+    if (st.ai_available) {
+      hint.style.display = "none";
+    } else {
+      hint.style.display = "";
+      hint.textContent = `AI 模型无法连接，已自动降级为纯字典模式：只会举报命中违禁词词典的弹幕（${st.dictionary_count ?? 0} 条词条）。请检查 config.yaml 的 ai.base_url / ai.model。`;
+    }
+    const box = $("accounts");
+    box.textContent = "";
+    const list = acc.accounts || [];
+    if (!acc.enabled || !list.length) { box.textContent = "未配置"; return; }
+    list.forEach(a => {
+      const el = document.createElement("span");
+      el.className = "badge " + (a.invalid ? "failed" : (a.is_limited ? "stopped" : "done"));
+      let label = a.name || "未命名";
+      if (a.is_current) label += " · 使用中";
+      if (a.invalid) label += " · 已失效";
+      else if (a.is_limited) label += ` · 冷却 ${a.limited_remaining}s`;
+      el.textContent = label;
+      el.title = a.invalid_reason || a.limited_reason
+        || `成功 ${a.success ?? 0} / 失败 ${a.failed ?? 0}`;
+      box.appendChild(el);
+    });
+  } catch {}
+}
+
+async function attachRunningTask() {
+  if (currentTaskId) return;
+  try {
+    const list = await (await fetch("/api/tasks")).json();
+    const active = list.find(t => t.status === "running" || t.status === "queued");
+    if (!active) return;
+    currentTaskId = active.id;
+    setStatusBadge(active.status, active.title || active.url);
+    setStats(active.stats);
+    $("loop-badge").style.display = active.loop_mode ? "" : "none";
+    $("start-btn").disabled = true;
+    $("stop-btn").disabled = false;
+    appendLog("info", `已接管进行中的任务：${active.url}`);
+    startStream(active.id);
+  } catch {}
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
 }
@@ -348,6 +435,10 @@ $("log").addEventListener("scroll", () => {
 
 loadTasks();
 loadSession();
+loadStatus();
+attachRunningTask();
+// 定期刷新运行模式与账号状态（冷却倒计时、账号失效都能看到）
+setInterval(loadStatus, 10000);
 </script>
 </body>
 </html>

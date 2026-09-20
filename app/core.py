@@ -15,13 +15,14 @@ from pathlib import Path
 import yaml
 
 from app.ai import AIAnalyzer
-from app.accounts import AccountManager
+from app.accounts import AccountManager, NoAccountAvailableError
 from app.paths import resource_path
 from app.bilibili import (
     BiliAPIError,
     BiliClient,
     CookieExpiredError,
     DailyLimitError,
+    DanmakuHandledError,
     RateLimitError,
     extract_bvid,
     fetch_all_danmaku,
@@ -83,6 +84,10 @@ class Task:
     seen_dmids: set[int] = field(default_factory=set)
     reported_dmids: set[int] = field(default_factory=set)
     content_report_count: dict[str, int] = field(default_factory=dict)
+    # 内容级失败熔断：各内容的累计提交失败次数，以及已放弃的内容。
+    # 用来避免同一个内容在上千条重复弹幕上反复轮换账号、无限刷日志。
+    content_fail_count: dict[str, int] = field(default_factory=dict)
+    abandoned_contents: set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +105,12 @@ class Task:
             "loop_mode": self.loop_mode,
             "loop_round": self.loop_round,
         }
+
+
+def _brief(text: str, limit: int = 30) -> str:
+    """把弹幕内容截断为便于日志展示的短文本。"""
+    t = " ".join((text or "").split())
+    return t if len(t) <= limit else t[:limit] + "…"
 
 
 def _stats_dict(s: TaskStats) -> dict:
@@ -189,6 +200,9 @@ class EventBus:
 
     # 便捷发布方法
     async def log(self, task_id: str, level: str, message: str) -> None:
+        # 同步写入日志文件：bus 事件只推给前端（SSE）不落盘，若只推前端，
+        # 用户从 logs/app.log 里就只看到账号切换、看不到举报成败，无法排查问题。
+        _bus_file_logger.log(_LOG_LEVELS.get(level, logging.INFO), message)
         await self.publish(Event(task_id=task_id, type="log", level=level, message=message))
 
     async def stats(self, task_id: str, data: dict) -> None:
@@ -200,6 +214,15 @@ class EventBus:
 
 # 全局事件总线
 bus = EventBus()
+
+# bus 事件的落盘日志器（事件本身只在前端 SSE 展示，这里镜像一份到 logs/app.log）
+_bus_file_logger = logging.getLogger("task")
+_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
 
 
 # =====================================================================
@@ -274,13 +297,15 @@ class DictEntry:
 
 
 class BannedDictionary:
-    """加载违禁词词典并提供大小写不敏感的匹配。
+    r"""加载违禁词词典并提供大小写不敏感的匹配。
 
     匹配模式（每条词条独立）：
       - contains（默认）：子串包含匹配。中文词条默认采用此模式。
       - word：词边界匹配，前后不能是字母或数字。纯 ASCII 字母数字词条默认采用此模式，
               避免短词误伤（如 OP 命中 OPPO、SB 命中 USB）。
       - exact：完全匹配，整个弹幕内容必须等于词条。
+      - regex：词条本身是正则表达式（原样编译，不做转义），用于群号/联系方式等
+              无法穷举的模式，例如 群[:：，,、]?\s*[1-9]\d{5,9}
 
     词典格式（YAML，向后兼容）：
         类别名:
@@ -291,6 +316,8 @@ class BannedDictionary:
             # 或使用对象形式精细控制匹配模式
             - word: OP
               mode: word
+            - word: '群[:：]?\s*\d{6,}'
+              mode: regex
 
     若未显式指定 mode，按词条字符类型自动选择：纯 ASCII 字母数字 → word；否则 → contains。
     """
@@ -339,7 +366,12 @@ class BannedDictionary:
                     continue
                 if not isinstance(word_str, str) or not word_str.strip():
                     continue
-                entry = self._build_entry(word_str, reason, mode)
+                try:
+                    entry = self._build_entry(word_str, reason, mode)
+                except re.error as e:
+                    # 正则写错不该让整个程序起不来：跳过并在日志里点明是哪条
+                    logger.error("违禁词条正则无效，已跳过：%r - %s", word_str, e)
+                    continue
                 if entry:
                     entries.append(entry)
                     count += 1
@@ -369,8 +401,12 @@ class BannedDictionary:
         if not w:
             return None
         m = (mode or BannedDictionary._default_mode(w)).strip().lower()
-        if m not in {"contains", "word", "exact"}:
+        if m not in {"contains", "word", "exact", "regex"}:
             m = BannedDictionary._default_mode(w)
+        if m == "regex":
+            # 正则模式：词条即表达式，原样编译（不转义）
+            pattern = re.compile(w, re.IGNORECASE)
+            return DictEntry(word=w, reason=reason, mode=m, pattern=pattern)
         escaped = re.escape(w)
         if m == "word":
             # 前后不能是字母或数字（独立词）；大小写不敏感
@@ -423,6 +459,11 @@ class TaskManager:
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
         self._current_task_id: str | None = None
+        # 已向 UI 推送过「账号失效」提示的账号名，避免重复刷屏
+        self._announced_invalid: set[str] = set()
+        # 让账号管理器在「全账号冷却等待」时能感知停止请求，点停止立即生效
+        if account_manager is not None:
+            account_manager.should_abort = self._is_stop_requested
 
     # ---- 生命周期 ----
     async def start(self) -> None:
@@ -473,6 +514,11 @@ class TaskManager:
                 self.tasks.pop(t.id, None)
                 removed += 1
 
+    def _is_stop_requested(self) -> bool:
+        """当前任务是否已收到停止请求（供账号管理器打断等待循环）。"""
+        task = self.tasks.get(self._current_task_id) if self._current_task_id else None
+        return bool(task and task.stop_requested)
+
     def request_stop(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
         if not task:
@@ -481,6 +527,23 @@ class TaskManager:
         task.stop_event.set()
         logger.info("请求停止任务 id=%s", task_id)
         return True
+
+    def request_stop_all(self) -> int:
+        """给所有未结束的任务发停止信号（进程收到 Ctrl+C 时调用）。
+
+        否则 uvicorn 的优雅退出会先等连接关闭（浏览器上的 SSE 长连接会一直挂着），
+        这期间 worker 仍在继续举报，用户会以为"停止无效"。
+        """
+        count = 0
+        for task in self.tasks.values():
+            if task.status in {TaskStatus.DONE, TaskStatus.STOPPED, TaskStatus.FAILED}:
+                continue
+            task.stop_requested = True
+            task.stop_event.set()
+            count += 1
+        if count:
+            logger.info("已请求停止 %d 个进行中的任务", count)
+        return count
 
     def list_tasks(self) -> list[Task]:
         # 最新的在前
@@ -604,6 +667,12 @@ class TaskManager:
             else:
                 await self._finish_done(task)
 
+        except NoAccountAvailableError as e:
+            # 所有账号均不可用（Cookie 失效/达上限/长期风控）：终止任务，避免无限轮换
+            task.error = str(e)
+            logger.error("任务终止 id=%s: %s", task_id, e)
+            await bus.log(task_id, "error", task.error)
+            await self._finish_failed(task)
         except CookieExpiredError as e:
             task.error = f"Cookie 失效：{e}"
             await bus.log(task_id, "error", task.error)
@@ -632,6 +701,20 @@ class TaskManager:
         非循环模式下调用方不依赖返回值。
         """
         task_id = task.id
+        # 账号健康巡检：长循环任务中及时发现 Cookie 过期（带 TTL 缓存，不会每轮都打接口）
+        if self.account_manager is not None:
+            if not await self.account_manager.health_check():
+                raise NoAccountAvailableError(
+                    "所有账号均不可用（Cookie 失效或已达上限），任务终止"
+                )
+            # 只在首次发现时推送提示，避免循环模式每轮刷屏
+            for st in self.account_manager.status():
+                if st["invalid"] and st["name"] not in self._announced_invalid:
+                    self._announced_invalid.add(st["name"])
+                    await bus.log(
+                        task_id, "warning",
+                        f"账号 {st['name']} 已失效并退出轮换：{st['invalid_reason']}",
+                    )
         # 拉取弹幕（按视频时长估算分段数，提供进度反馈）
         estimated_segs = max(1, (info["duration"] + 359) // 360)
         await bus.log(
@@ -896,13 +979,12 @@ class TaskManager:
                 {ai_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
             )
             if stop_task in done:
-                # 停止信号先到：强制关闭 AI 底层 HTTP transport，秒级中断进行中的请求
-                logger.info("停止信号到达，强制中断 AI 请求...")
-                # aclose 现在是同步关闭 transport，不会阻塞
+                # 停止信号先到：关闭 AI 底层连接，秒级中断进行中的请求
+                logger.info("停止信号到达，中断 AI 请求...")
                 try:
-                    self.analyzer.aclose()
-                except Exception:
-                    pass
+                    await self.analyzer.aclose()
+                except Exception as e:
+                    logger.warning("中断 AI 请求时出错（忽略）: %s", e)
                 ai_task.cancel()
                 # 短暂等待 ai_task 收到连接异常后退出
                 try:
@@ -932,6 +1014,10 @@ class TaskManager:
     ) -> None:
         if dmid in task.reported_dmids:
             return
+        # 内容级熔断：该内容的举报已被判定无效，跳过其剩余重复弹幕
+        if content and content in task.abandoned_contents:
+            task.stats.skipped += 1
+            return
         # 已达举报上限：跳过并计入 skipped
         max_reports = self.settings.report.max_reports
         if max_reports > 0 and task.stats.reported >= max_reports:
@@ -949,7 +1035,14 @@ class TaskManager:
         # （仅当配置了多个账号且内容非空时生效；单账号场景下仍按同账号提交。）
         if content and self.account_manager is not None and self.account_manager.total > 1:
             k = task.content_report_count.get(content, 0)
-            self.account_manager.switch_for_content(k)
+            await self.account_manager.switch_for_content(k)
+
+        # 单条弹幕内允许的「换账号重试」次数上限：账号数 + 1。
+        # 达到上限说明账号整体不可用，应尽早放弃该条，避免无限轮换刷日志。
+        max_recoveries = (self.account_manager.total + 1) if self.account_manager else 0
+        recoveries = 0
+        # 风控退避步数（仅单账号或换号次数耗尽时使用）
+        backoff_step = 0
 
         # 普通业务错误的重试次数（不含风控/Cookie 问题）
         max_attempts = 3
@@ -973,30 +1066,46 @@ class TaskManager:
                 task.content_report_count[content] = task.content_report_count.get(content, 0) + 1
                 await bus.log(
                     task.id, "info",
-                    f"举报成功 dmid={dmid} reason={reason}",
+                    f"举报成功 dmid={dmid} reason={reason} "
+                    f"账号={self.bili.current_account_name or '未命名'}",
                 )
                 # 举报成功后立即推送 stats，前端实时刷新
                 await bus.stats(task.id, stats_to_dict(task.stats))
                 return
             except RateLimitError as e:
-                # 风控：触发账号切换（多账号轮换）；单账号场景下退避重试
-                if self.account_manager:
+                # 风控：多账号场景换号继续；单账号场景退避重试
+                am = self.account_manager
+                if am is not None and recoveries < max_recoveries:
                     await bus.log(
                         task.id, "warning",
                         f"账号 {self.bili.current_account_name} 触发风控({e})，切换账号中…",
                     )
                     # 切换账号内部会处理全风控等待循环
-                    await self.account_manager.switch_on_rate_limit()
-                    await bus.log(
-                        task.id, "info",
-                        f"已切换至账号 {self.bili.current_account_name}，继续举报 dmid={dmid}",
-                    )
-                    # 切换账号后重置 cooldown，新账号从基础间隔开始
-                    cooldown.reset()
-                    continue
-                # 单账号场景：指数退避重试
+                    switched = await am.switch_on_rate_limit(f"举报触发风控({e.code})")
+                    if switched:
+                        await bus.log(
+                            task.id, "info",
+                            f"已切换至账号 {self.bili.current_account_name}，继续举报 dmid={dmid}",
+                        )
+                        # 切换账号后重置 cooldown，新账号从基础间隔开始
+                        cooldown.reset()
+                        attempt = 0
+                        backoff_step = 0
+                        recoveries += 1
+                        continue
+                    if am.all_invalid:
+                        # 没有可轮换的账号，风控已无意义：终止任务（用户主动停止则按停止处理）
+                        if task.stop_requested:
+                            task.stats.skipped += 1
+                            await bus.stats(task.id, stats_to_dict(task.stats))
+                            return
+                        raise NoAccountAvailableError(
+                            "所有账号均不可用（Cookie 失效或已达上限），任务终止"
+                        )
+                # 单账号 / 换号次数耗尽：指数退避重试
                 cooldown.on_rate_limit()
-                wait = cooldown.backoff_wait(1)
+                wait = cooldown.backoff_wait(backoff_step)
+                backoff_step += 1
                 await bus.log(
                     task.id, "warning",
                     f"触发风控({e})，{wait:.0f}s 后重试 dmid={dmid}",
@@ -1007,26 +1116,55 @@ class TaskManager:
                     return
                 continue
             except (CookieExpiredError, DailyLimitError) as e:
-                # Cookie 失效/上限：多账号场景切到下一个账号；单账号场景停止任务
-                if self.account_manager:
-                    err_type = "Cookie失效" if isinstance(e, CookieExpiredError) else "当日上限"
-                    await bus.log(
-                        task.id, "warning",
-                        f"账号 {self.bili.current_account_name} {err_type}({e})，切换账号中…",
-                    )
-                    # 复用 switch_on_rate_limit 的轮换逻辑（标记当前账号冷却）
-                    switched = await self.account_manager.switch_on_rate_limit()
-                    if switched:
+                # Cookie 失效 / 当日上限：该账号退出轮换，换用其它可用账号重试同一条
+                am = self.account_manager
+                name = self.bili.current_account_name or "未命名"
+                if am is not None:
+                    if isinstance(e, CookieExpiredError):
+                        am.mark_current_invalid(f"Cookie 失效或未登录（{e}）")
+                        await bus.log(
+                            task.id, "warning",
+                            f"账号 {name} Cookie 已失效（{e}），已退出本次轮换",
+                        )
+                    else:
+                        am.mark_current_daily_limited(f"已达当日举报上限（{e}）")
+                        await bus.log(
+                            task.id, "warning",
+                            f"账号 {name} 已达当日举报上限（{e}），暂时退出轮换",
+                        )
+                    recoveries += 1
+                    if recoveries <= max_recoveries and await am.ensure_available():
                         await bus.log(
                             task.id, "info",
                             f"已切换至账号 {self.bili.current_account_name}，继续举报 dmid={dmid}",
                         )
                         cooldown.reset()
+                        attempt = 0
+                        backoff_step = 0
                         continue
-                # 单账号或无可用账号：停止任务，避免继续浪费 token
+                # 用户主动停止：按停止处理，不要误报为失败
+                if task.stop_requested:
+                    task.stats.skipped += 1
+                    await bus.stats(task.id, stats_to_dict(task.stats))
+                    return
+                # 无可用账号：终止任务，避免继续空转
                 task.stop_requested = True
                 task.stop_event.set()
-                raise
+                raise NoAccountAvailableError(
+                    f"账号 {name} 不可用，且已无其它可用账号（Cookie 失效或已达上限），任务终止"
+                )
+            except DanmakuHandledError as e:
+                # 弹幕已被处理（别人已举报/已删除）：无需再提交，标记为已处理不再重试，
+                # 不计入失败（否则会让用户以为账号有问题、也会误触发内容级熔断）
+                task.reported_dmids.add(dmid)
+                task.stats.skipped += 1
+                logger.info("弹幕已被处理，跳过 dmid=%s: %s", dmid, e)
+                await bus.log(
+                    task.id, "info",
+                    f"弹幕已被处理，跳过 dmid={dmid}（{e}）",
+                )
+                await bus.stats(task.id, stats_to_dict(task.stats))
+                return
             except BiliAPIError as e:
                 # 业务失败（如“已举报”）不占用有效举报上限，仅计入 failed
                 task.stats.failed += 1
@@ -1034,9 +1172,10 @@ class TaskManager:
                     self.account_manager.on_fail()
                 await bus.log(
                     task.id, "warning",
-                    f"举报失败 dmid={dmid}: {e}",
+                    f"举报失败 dmid={dmid} 账号={self.bili.current_account_name or '未命名'}: {e}",
                 )
                 await bus.stats(task.id, stats_to_dict(task.stats))
+                await self._note_content_failure(task, content)
                 return
             except Exception as e:
                 attempt += 1
@@ -1051,9 +1190,30 @@ class TaskManager:
                         f"举报异常 dmid={dmid}: {e}（重试 {attempt} 次仍失败）",
                     )
                     await bus.stats(task.id, stats_to_dict(task.stats))
+                    await self._note_content_failure(task, content)
                     return
                 logger.warning("举报异常 dmid=%s: %s，第 %d 次重试", dmid, e, attempt)
                 continue
+
+    async def _note_content_failure(self, task: Task, content: str) -> None:
+        """记录内容级提交失败；达到阈值后熔断该内容的剩余重复弹幕。
+
+        同一条弹幕内容在所有账号下都无法提交成功时，继续为它的其它重复 dmid
+        轮换账号只是白刷日志和请求，直接放弃该内容更合理。
+        """
+        if not content or content in task.abandoned_contents:
+            return
+        fail_count = task.content_fail_count.get(content, 0) + 1
+        task.content_fail_count[content] = fail_count
+        limit = max(2, self.account_manager.total if self.account_manager else 1)
+        if fail_count < limit:
+            return
+        task.abandoned_contents.add(content)
+        await bus.log(
+            task.id, "warning",
+            f"内容「{_brief(content)}」在可用账号下提交均失败（{fail_count} 次），"
+            f"放弃该内容的剩余重复弹幕",
+        )
 
     async def _interruptible_sleep(self, task: Task, seconds: float) -> bool:
         """可被 stop_event 中断的 sleep。被中断返回 False，正常结束返回 True。"""

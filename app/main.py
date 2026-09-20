@@ -82,9 +82,14 @@ async def lifespan(app: FastAPI):
     account_manager = AccountManager(accounts, bili, s.bilibili)
     ok = await account_manager.init_first_account()
     if not ok:
+        detail = "；".join(
+            f"{st['name']}：{st['invalid_reason'] or '不可用'}"
+            for st in account_manager.status() if st["invalid"]
+        )
         await bili.aclose()
         raise RuntimeError(
             "所有账号登录态校验失败，请检查 accounts.yaml 中的 SESSDATA / bili_jct"
+            + (f"（{detail}）" if detail else "")
         )
 
     analyzer = AIAnalyzer(s.ai)

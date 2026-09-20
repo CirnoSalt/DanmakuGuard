@@ -8,7 +8,9 @@ import re
 import time
 from dataclasses import dataclass
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, AsyncOpenAI
+
+import httpx
 
 from app.config import AIConfig
 
@@ -19,45 +21,20 @@ logger = logging.getLogger("ai")
 # 系统提示词
 # =====================================================================
 
-SYSTEM_PROMPT = """你是弹幕审核员，对B站弹幕做快速违规判定。基于关键词直觉判断，不要逐条推理分析。
+SYSTEM_PROMPT = """你是B站弹幕审核员，凭关键词直觉快速判定，输出必须极简。
+违规类型：人身攻击辱骂、色情低俗、引战对立、违法违禁、垃圾广告引流、侵犯隐私、恶意刷屏、青少年不良。
+不违规：正常吐槽、玩梗、表达观点、剧透、与视频相关的闲聊。禁止以"剧透""与视频无关"判违规。
 
-判定违规的情形（命中任一即违规）：
-- 人身攻击、辱骂、侮辱性言论
-- 色情低俗
-- 引战、煽动对立、地域/性别攻击
-- 违法违禁
-- 垃圾广告、引流
-- 侵犯隐私
-- 恶意刷屏
-- 青少年不良信息
+输出规则（严格遵守，用于降低开销）：
+- 只列出违规弹幕，严格遵守下面格式，不要输出解释、思考过程、<think> 标签或 markdown 代码块。
+- 没有任何违规时，必须输出 {"items":[]}。
+- id 必须与输入的 id 完全一致；未列出的 id 一律视为不违规。
 
-不违规：正常吐槽、玩梗、表达观点（即使语气重但无攻击性）、剧透讨论、与视频相关的闲聊。
+输出格式（严格 JSON，无其他文字）：
+{"items":[{"id":<输入id>,"violates":true,"reason":<代码>,"confidence":<0.0-1.0>}]}
 
-限制：
-- 无法获知视频内容，不得以"剧透"或"与视频无关"为由判违规。
-- 不要思考、不要分析、不要解释，直接给出 JSON 结果。
-- 禁止输出 <think> 标签、推理过程、markdown 代码块标记或任何额外文字。
-- 输出必须以 { 开头、以 } 结尾，是一个紧凑的 JSON 对象。
-
-输出格式（严格 JSON，无任何附加内容）：
-{"items":[{"id":<整数id>,"violates":<true|false>,"reason":<下方代码表中整数>,"confidence":<0.0-1.0>}]}
-
-reason 代码表（仅可使用以下代码，禁止使用 8 剧透 和 10 视频无关）：
-1 违法违禁
-2 色情低俗
-3 非法交易
-4 人身攻击
-5 侵犯隐私
-6 垃圾广告
-7 引战
-9 恶意刷屏
-11 其他
-12 青少年不良
-
-规则：
-- id 必须与输入 id 完全一致，每条输入都必须有且仅有一条结果。
-- 不违规时 reason 填 11、violates 填 false。
-- confidence 反映判定置信度（0.0-1.0），简单明确的判定给 0.9 以上。
+reason 代码（禁止使用 8 剧透、10 视频无关）：
+1违法违禁 2色情低俗 3非法交易 4人身攻击 5侵犯隐私 6垃圾广告 7引战 9恶意刷屏 11其他 12青少年不良
 """
 
 
@@ -85,8 +62,6 @@ class AIAnalyzer:
             timeout=config.timeout,
             max_retries=0,
         )
-        # 持有底层 httpx client，停止任务时可直接 aclose() 中断进行中的请求
-        self._httpx_client = self.client._client
         # 模型连通性标记：启动探测失败时置 False，任务处理自动退化为纯字典模式
         self.available: bool = False
 
@@ -124,27 +99,29 @@ class AIAnalyzer:
                 pass
         return self.available
 
-    def aclose(self) -> None:
-        """强制关闭底层 HTTP transport，中断所有进行中的 AI 请求。
+    async def aclose(self) -> None:
+        """关闭底层 HTTP 连接，中断所有进行中的 AI 请求。
 
-        停止任务时调用，实现秒级中断（asyncio.Task.cancel 对 httpx 进行中请求不立即生效）。
-        直接关闭 transport 是非阻塞操作，进行中的请求会立即收到连接异常。
-        关闭后会重建 client，避免后续请求复用已关闭的连接。
+        停止任务时调用，实现秒级中断。注意必须走 SDK/httpx 的**异步** close：
+        httpx 的 AsyncHTTPTransport 并没有同步 close()（早期实现里调
+        `transport.close()` 会抛 AttributeError 并被静默吞掉，等于没中断），
+        而 `await client.close()` 会立刻关闭连接池，让在途请求马上以
+        ReadError/APIConnectionError 结束（本机实测 0.5s 内）。
+
+        关闭后重建 client，避免后续请求复用已关闭的连接。
         """
-        # 直接关闭底层 transport（同步非阻塞），让进行中的请求立即收到连接异常
+        old = self.client
         try:
-            if self._httpx_client._transport is not None:
-                self._httpx_client._transport.close()
-        except Exception:
-            pass
-        # 重建 client，避免后续请求复用已关闭的连接
-        self.client = AsyncOpenAI(
-            base_url=self.config.base_url,
-            api_key=self.config.api_key,
-            timeout=self.config.timeout,
-            max_retries=0,
-        )
-        self._httpx_client = self.client._client
+            await old.close()
+        except Exception as e:
+            logger.warning("关闭 AI 连接时出错（忽略）: %s", e)
+        finally:
+            self.client = AsyncOpenAI(
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                timeout=self.config.timeout,
+                max_retries=0,
+            )
 
     async def analyze_batch(self, items: list[dict]) -> list[AnalysisResult]:
         """分析一批弹幕。
@@ -155,7 +132,8 @@ class AIAnalyzer:
         if not items:
             return []
 
-        user_content = json.dumps(items, ensure_ascii=False)
+        # 紧凑序列化：去掉分隔符后的空格，减少输入 token
+        user_content = json.dumps(items, ensure_ascii=False, separators=(",", ":"))
         last_exc: Exception | None = None
 
         # 构建请求参数：reasoning_effort 仅在配置非空时发送（兼容不支持该参数的 API）
@@ -170,9 +148,21 @@ class AIAnalyzer:
         # temperature=0 在部分思考型模型实现中会触发更长推理，仅在配置 >0 时传递
         if self.config.temperature > 0:
             kwargs["temperature"] = self.config.temperature
-        # reasoning_effort 控制思考型模型推理深度，minimal 显著降低思考开销
-        if self.config.reasoning_effort and self.config.reasoning_effort.strip():
+        # extra_body 原样透传给接口（OpenRouter 的 reasoning、LM Studio 关闭 Qwen3 思考
+        # 的 chat_template_kwargs 等都从这里传），能省下大量思考 token
+        if self.config.extra_body:
+            kwargs["extra_body"] = self.config.extra_body
+        # reasoning_effort 是 OpenAI 风格的顶层参数：OpenRouter 只认 reasoning 对象、
+        # 不认顶层的 reasoning_effort（会报错或浪费一次请求），因此当 extra_body 里
+        # 已经给了 reasoning 时就不再发送它。
+        has_reasoning_obj = bool(self.config.extra_body.get("reasoning"))
+        if self.config.reasoning_effort.strip() and not has_reasoning_obj:
             kwargs["reasoning_effort"] = self.config.reasoning_effort.strip()
+        # 日志里展示实际生效的推理设置，方便确认"到底有没有关掉思考"
+        if has_reasoning_obj:
+            reasoning_desc = json.dumps(self.config.extra_body["reasoning"], ensure_ascii=False)
+        else:
+            reasoning_desc = kwargs.get("reasoning_effort", "-")
 
         for attempt in range(1, 4):
             try:
@@ -180,8 +170,7 @@ class AIAnalyzer:
                 cur_max = kwargs.get("max_tokens", self.config.max_tokens)
                 logger.info(
                     "AI 请求开始 model=%s count=%d attempt=%d max_tokens=%d reasoning=%s",
-                    self.config.model, len(items), attempt, cur_max,
-                    self.config.reasoning_effort or "-",
+                    self.config.model, len(items), attempt, cur_max, reasoning_desc,
                 )
                 resp = await self.client.chat.completions.create(**kwargs)
                 choice = resp.choices[0]
@@ -197,7 +186,8 @@ class AIAnalyzer:
                             choice.finish_reason, elapsed, cur_max, new_max,
                         )
                         kwargs["max_tokens"] = new_max
-                        # 移除 reasoning_effort 进一步抑制思考，给输出腾出 token 空间
+                        # OpenAI 风格接口下移除 reasoning_effort 进一步抑制思考；
+                        # extra_body 保持原样（其中可能已经关掉/压缩了思考预算）
                         kwargs.pop("reasoning_effort", None)
                         continue
                     logger.warning(
@@ -216,14 +206,14 @@ class AIAnalyzer:
             except Exception as e:
                 elapsed = time.monotonic() - t0
                 last_exc = e
-                # 检查是否为连接异常（aclose 会导致 Connection error）
-                # 若是，说明是停止信号触发的中断，不再重试
+                # 检查是否为连接层异常（aclose 会导致连接被关闭）
+                # 若是，说明多半是停止信号触发的中断，不再重试（重试会再等一个 timeout）
                 err_msg = str(e).lower()
                 is_connection_error = (
-                    "connection error" in err_msg
+                    isinstance(e, (APIConnectionError, httpx.TransportError, ConnectionError))
+                    or "connection error" in err_msg
                     or "connection reset" in err_msg
                     or "connection closed" in err_msg
-                    or isinstance(e, (ConnectionError,))
                 )
                 if is_connection_error:
                     logger.warning(
@@ -231,13 +221,17 @@ class AIAnalyzer:
                         attempt, elapsed, e,
                     )
                     return []
-                # 部分后端不支持 reasoning_effort 参数，首次失败时移除后重试
-                if attempt == 1 and "reasoning_effort" in kwargs:
+                # 参数兼容性兜底：部分后端不支持 reasoning_effort 或透传字段，
+                # 首次失败时移除后重试一次，避免整批因"参数不支持"而全军覆没
+                if attempt == 1 and ("reasoning_effort" in kwargs or "extra_body" in kwargs):
+                    removed = [
+                        k for k in ("reasoning_effort", "extra_body")
+                        if kwargs.pop(k, None) is not None
+                    ]
                     logger.warning(
-                        "AI 批分析失败(第%d次, %.1fs): %s，移除 reasoning_effort 后重试",
-                        attempt, elapsed, e,
+                        "AI 批分析失败(第%d次, %.1fs): %s，移除 %s 后重试",
+                        attempt, elapsed, e, "/".join(removed),
                     )
-                    kwargs.pop("reasoning_effort", None)
                     continue
                 logger.warning("AI 批分析失败(第%d次, %.1fs): %s", attempt, elapsed, e)
                 # 重试前短退避，避免本地模型过载时连续冲击
@@ -277,7 +271,8 @@ class AIAnalyzer:
             except (TypeError, ValueError):
                 continue
 
-        # 保证每条输入都有结果；AI 漏掉的按"不违规"处理
+        # 保证每条输入都有结果；AI 按提示词只返回违规项，未返回的视为不违规。
+        # 注意：这里默认按"不违规"处理，所以模型漏答只会少举报，不会误举报。
         results: list[AnalysisResult] = []
         for it in items:
             did = int(it["id"])
